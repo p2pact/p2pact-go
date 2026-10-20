@@ -6,7 +6,7 @@
 //	{"cmd":"invite"}                                          → {"invite":"p2pact1.…"}
 //	{"cmd":"join","invite":"…"}                               → {"peer":"…"}
 //	{"cmd":"known","peer":"…"}                                → {"known":true|false}
-//	{"cmd":"call","peer":"…","data":"<base64>"}               → {"data":"<base64>"}  (echo, tool 64 method 1)
+//	{"cmd":"call","peer":"…","data":"<base64>","stream":N}    → {"data":"<base64>"}  (echo, tool 64 method 1; stream optional)
 //	{"cmd":"dict","raw":"<base64>"}                           → {"ok":true}
 //	{"cmd":"close"}
 //
@@ -59,6 +59,7 @@ func main() {
 			Cmd, UDP, Invite, Peer string
 			TCP                    *string
 			Data, Raw              []byte
+			Stream                 uint64
 		}
 		if json.Unmarshal(in.Bytes(), &req) != nil {
 			say(map[string]string{"error": "bad json"})
@@ -107,7 +108,7 @@ func main() {
 			say(map[string]bool{"known": n.Trust.Get(req.Peer) != nil})
 		case "call":
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			res, err := n.Call(ctx, req.Peer, 64, 1, req.Data)
+			res, err := n.CallOn(ctx, req.Peer, req.Stream, 64, 1, req.Data)
 			cancel()
 			var b []byte
 			if err == nil && (len(res) == 0 || cbor.Unmarshal(res[0], &b) != nil) {
