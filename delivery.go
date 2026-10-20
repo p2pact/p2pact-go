@@ -441,8 +441,9 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 		}
 		s.acked(done)
 		// time-based loss detection (RACK, RFC 8985): a part sent a quarter of a round trip
-		// before one that arrived, and still not acknowledged, is lost — resend it now
-		if !newest.IsZero() {
+		// before one that arrived, and still not acknowledged, is lost — resend it now. A
+		// reliable road loses nothing: there a late ack only means the road's own queue.
+		if !newest.IsZero() && !s.reliable {
 			reorder := max(s.srtt/4, time.Millisecond)
 			lost := false
 			for _, p := range s.inflight {
@@ -457,7 +458,7 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 		// fast retransmit, as TCP after three duplicate acks: three parts after the gap arrived,
 		// so the gap is lost — resend it now instead of waiting for the timer. Fewer than
 		// three may be reordering: wait a quarter of a round trip.
-		if beyond > 0 {
+		if beyond > 0 && !s.reliable {
 			if p := s.inflight[uint32(upto+1)]; p != nil &&
 				(beyond >= 3 || now.Sub(p.sent) >= max(s.srtt/4, ackDelay)) {
 				p.sent = time.Time{}
