@@ -1096,6 +1096,9 @@ func (n *Node) pumpLocked(now time.Time) {
 			delete(n.current, peer)
 			continue
 		}
+		if c := n.candidatesLocked(peer, ps, now, false); len(c) == 1 {
+			ps.st.reliable = c[0].ep.Road.Name() != "udp"
+		}
 		for i := 0; ; i++ {
 			if i == 256 { // a burst at a time; the rest on the next wake
 				n.wakeLocked()

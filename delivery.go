@@ -66,6 +66,7 @@ type stream struct {
 	// in flight we keep at most what the link delivers in two round trips
 	delivered     int64
 	inflightBytes int64
+	reliable      bool // the current road is a reliable stream: no window of our own
 	bw            float64
 	bwAt          time.Time
 
@@ -103,6 +104,9 @@ func (s *stream) rate(now time.Time, r float64) {
 // its minimum). Without a queue the rate samples may come from small messages that never
 // filled the link, so they must not hold it back.
 func (s *stream) canSend() bool {
+	if s.reliable { // the road (TCP, a relay over TLS) controls congestion itself
+		return len(s.inflight) < cwndMax
+	}
 	if len(s.inflight) >= int(s.cwnd) {
 		return false
 	}

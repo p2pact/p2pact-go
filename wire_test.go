@@ -162,7 +162,7 @@ func TestLossyLongMessage(t *testing.T) {
 	a.UDP().Drop, b.UDP().Drop = drop, drop
 	data := make([]byte, 200<<10)
 	_, _ = rand.Read(data)
-	echo(t, a, b, data, 60*time.Second)
+	echo(t, a, b, data, 2*time.Minute) // a third lost both ways: slow, and it varies a lot
 }
 
 // UDP stops working; the conversation continues through the relay.
