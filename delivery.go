@@ -167,7 +167,13 @@ func (s *stream) timeout(p *part, ahead int) time.Duration {
 	if s.bw > 0 {
 		t += time.Duration(float64(ahead*maxPart) / s.bw * float64(time.Second))
 	}
-	for i := 1; i < p.tries && t < rtoMax; i++ {
+	// back off only on signs of congestion, or after three tries in a row: a random loss
+	// (radio, a busy Wi-Fi) does not mean the link needs a rest
+	backoff := p.tries - 1
+	if !s.queueing() {
+		backoff = max(0, p.tries-3)
+	}
+	for i := 0; i < backoff && t < rtoMax; i++ {
 		t *= 2
 	}
 	return min(t, rtoMax)
@@ -390,10 +396,14 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 		}
 		b = b[n:]
 		done := 0
+		var newest time.Time // the latest send time among the parts this ack covers
 		ack := func(seq uint32) {
 			p := s.inflight[seq]
 			if p == nil {
 				return
+			}
+			if p.sent.After(newest) {
+				newest = p.sent
 			}
 			s.delivered += int64(len(p.data))
 			if p.tries == 1 {
@@ -430,6 +440,20 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 			cursor = start + run
 		}
 		s.acked(done)
+		// time-based loss detection (RACK, RFC 8985): a part sent a quarter of a round trip
+		// before one that arrived, and still not acknowledged, is lost — resend it now
+		if !newest.IsZero() {
+			reorder := max(s.srtt/4, time.Millisecond)
+			lost := false
+			for _, p := range s.inflight {
+				if !p.sent.IsZero() && p.sent.Add(reorder).Before(newest) {
+					p.sent, lost = time.Time{}, true
+				}
+			}
+			if lost {
+				s.lost(now)
+			}
+		}
 		// fast retransmit, as TCP after three duplicate acks: three parts after the gap arrived,
 		// so the gap is lost — resend it now instead of waiting for the timer. Fewer than
 		// three may be reordering: wait a quarter of a round trip.
