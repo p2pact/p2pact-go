@@ -64,6 +64,9 @@ go test ./...
 go test -v -run Compare .    # sizes and timings against JSON over TLS and HTTPS
 ```
 
+`cmd/p2pact-interop` is the reference interop peer: other implementations are tested against
+it in [p2pact-tests](https://github.com/p2pact/p2pact-tests).
+
 ## License
 
 [Apache License 2.0](LICENSE).

@@ -7,10 +7,12 @@ package p2pact
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
+	"hash"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,7 +104,7 @@ func randBytes(n int) []byte {
 
 // mac is HMAC-BLAKE2s(key, label): relay channels and invite ids are derived from secrets.
 func mac(key []byte, label string) []byte {
-	h, _ := blake2s.New256(key)
+	h := hmac.New(func() hash.Hash { b, _ := blake2s.New256(nil); return b }, key)
 	h.Write([]byte(label))
 	return h.Sum(nil)
 }
