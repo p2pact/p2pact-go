@@ -579,6 +579,9 @@ func (n *Node) onDataLocked(now time.Time, pkt []byte, from Endpoint) {
 	ps := n.peerLocked(s.peer)
 	n.seenLocked(ps, from, now)
 	_ = ps.st.receive(now, plain, func(msg []byte, zip bool) { n.inboundLocked(s.peer, msg, zip) })
+	if !ps.st.ackDue.IsZero() && !now.Before(ps.st.ackDue) {
+		n.wakeLocked() // an ack is due now
+	}
 }
 
 // onInitLocked: a known device starts a session (Noise_IK) with data in the first packet.
@@ -1052,7 +1055,11 @@ func (n *Node) pumpLocked(now time.Time) {
 			delete(n.current, peer)
 			continue
 		}
-		for i := 0; i < 64; i++ {
+		for i := 0; ; i++ {
+			if i == 256 { // a burst at a time; the rest on the next wake
+				n.wakeLocked()
+				break
+			}
 			plain, retry := ps.st.nextPacket(now, false)
 			if plain == nil {
 				break

@@ -20,6 +20,10 @@ import (
 // zipMin: shorter messages are not compressed; the gain is below the overhead.
 const zipMin = 64
 
+// zipFastFrom: from this size on, a faster zstd level — the best one costs more time than
+// the few percent of bytes it saves.
+const zipFastFrom = 32 << 10
+
 // dictKeep is how many dictionaries to keep: new ones and those still in flight.
 const dictKeep = 4
 
@@ -33,6 +37,7 @@ type Dict struct {
 
 	once sync.Once
 	enc  *zstd.Encoder
+	fast *zstd.Encoder
 	dec  *zstd.Decoder
 	err  error
 }
@@ -57,6 +62,10 @@ func (d *Dict) init() error {
 		d.enc, d.err = zstd.NewWriter(nil, zstd.WithEncoderDict(d.Raw), zstd.WithEncoderCRC(false),
 			zstd.WithEncoderLevel(zstd.SpeedBestCompression), zstd.WithEncoderConcurrency(1))
 		if d.err == nil {
+			d.fast, d.err = zstd.NewWriter(nil, zstd.WithEncoderDict(d.Raw), zstd.WithEncoderCRC(false),
+				zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
+		}
+		if d.err == nil {
 			d.dec, d.err = zstd.NewReader(nil, zstd.WithDecoderDicts(d.Raw), zstd.WithDecoderConcurrency(1),
 				zstd.WithDecoderMaxMemory(msgMax))
 		}
@@ -67,12 +76,15 @@ func (d *Dict) init() error {
 var plainZ struct {
 	once sync.Once
 	enc  *zstd.Encoder
+	fast *zstd.Encoder
 	dec  *zstd.Decoder
 }
 
 func plainCodec() (*zstd.Encoder, *zstd.Decoder) {
 	plainZ.once.Do(func() {
 		plainZ.enc, _ = zstd.NewWriter(nil, zstd.WithEncoderCRC(false), zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+			zstd.WithEncoderConcurrency(1))
+		plainZ.fast, _ = zstd.NewWriter(nil, zstd.WithEncoderCRC(false), zstd.WithEncoderLevel(zstd.SpeedDefault),
 			zstd.WithEncoderConcurrency(1))
 		plainZ.dec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(msgMax))
 	})
@@ -86,11 +98,17 @@ func compress(msg []byte, d *Dict, slot int) []byte {
 		return nil
 	}
 	enc, _ := plainCodec()
+	if len(msg) >= zipFastFrom {
+		enc = plainZ.fast
+	}
 	if d != nil {
 		if d.init() != nil {
 			return nil
 		}
 		enc = d.enc
+		if len(msg) >= zipFastFrom {
+			enc = d.fast
+		}
 	}
 	frame := stripFrame(enc.EncodeAll(msg, nil))
 	if frame == nil || 1+len(frame) >= len(msg) {
