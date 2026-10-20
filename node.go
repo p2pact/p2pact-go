@@ -74,6 +74,7 @@ type earlyPacket struct {
 type epState struct {
 	ep                 Endpoint
 	lastRecv, lastSend time.Time
+	session            uint32 // our index of the session its last packet belonged to
 }
 
 type peerState struct {
@@ -595,7 +596,7 @@ func (n *Node) onDataLocked(now time.Time, pkt []byte, from Endpoint) {
 		n.current[s.peer] = s
 	}
 	ps := n.peerLocked(s.peer)
-	n.seenLocked(ps, from, now)
+	n.seenLocked(ps, from, now, s.local)
 	_ = ps.st.receive(now, plain, func(msg []byte, zip bool) { n.inboundLocked(s.peer, msg, zip) })
 	if !ps.st.ackDue.IsZero() && !now.Before(ps.st.ackDue) {
 		n.wakeLocked() // an ack is due now
@@ -633,7 +634,7 @@ func (n *Node) onInitLocked(now time.Time, pkt []byte, from Endpoint) {
 	n.sessions[local] = s
 	n.current[peer] = s
 	n.handshakes.Add(1)
-	n.seenLocked(ps, from, now)
+	n.seenLocked(ps, from, now, s.local)
 	n.bootLocked(ps, binary.BigEndian.Uint32(payload[8:12]))
 	out := put32(put32([]byte{pResp}, s.remote), local)
 	_ = from.Road.Send(from.Addr, append(out, resp...))
@@ -662,7 +663,7 @@ func (n *Node) onRespLocked(now time.Time, pkt []byte, from Endpoint) {
 	n.current[h.peer] = s
 	n.handshakes.Add(1)
 	ps := n.peerLocked(h.peer)
-	n.seenLocked(ps, from, now)
+	n.seenLocked(ps, from, now, s.local)
 	n.bootLocked(ps, binary.BigEndian.Uint32(payload[:4]))
 	n.sendInfoLocked(h.peer)
 	for _, e := range h.early {
@@ -740,7 +741,7 @@ func (n *Node) onPair2Locked(now time.Time, pkt []byte, from Endpoint) {
 	n.sessions[local] = s
 	n.current[peer] = s
 	ps := n.peerLocked(peer)
-	n.seenLocked(ps, from, now)
+	n.seenLocked(ps, from, now, s.local)
 	n.bootLocked(ps, pp.Boot)
 	_ = from.Road.Send(from.Addr, append(put32([]byte{pPair3}, s.remote), msg3...))
 	n.pairedLocked(p)
@@ -775,7 +776,7 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	n.sessions[local] = s
 	n.current[peer] = s
 	ps := n.peerLocked(peer)
-	n.seenLocked(ps, from, now)
+	n.seenLocked(ps, from, now, s.local)
 	n.bootLocked(ps, pp.Boot)
 	n.pairedLocked(p)
 }
@@ -913,14 +914,14 @@ func (n *Node) peerLocked(peer string) *peerState {
 	return ps
 }
 
-func (n *Node) seenLocked(ps *peerState, from Endpoint, now time.Time) {
+func (n *Node) seenLocked(ps *peerState, from Endpoint, now time.Time, session uint32) {
 	k := from.key()
 	e := ps.eps[k]
 	if e == nil {
 		e = &epState{ep: from}
 		ps.eps[k] = e
 	}
-	e.lastRecv = now
+	e.lastRecv, e.session = now, session
 }
 
 // candidatesLocked picks where to send: live roads; with none alive or on retransmission,
@@ -930,6 +931,19 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 	for _, e := range ps.eps {
 		if now.Sub(e.lastRecv) <= aliveFor {
 			alive = append(alive, e)
+		}
+	}
+	// prefer roads the current session was heard on: earlier sessions (the device before a
+	// restart, another program with the same keys) may have used roads that are gone now
+	if s := n.current[peer]; s != nil && !all {
+		var cur []*epState
+		for _, e := range alive {
+			if e.session == s.local {
+				cur = append(cur, e)
+			}
+		}
+		if len(cur) > 0 {
+			alive = cur
 		}
 	}
 	if len(alive) > 0 && !all {
@@ -942,9 +956,18 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 			}
 			return 2
 		}
+		// the road heard from last: a device that reconnected (a new TCP connection, a new
+		// port behind NAT, UDP blocked so it moved to TCP) leaves its old endpoint "alive"
+		// for a while, but it is dead. A better kind of road wins only if it was heard from
+		// within half a second of it (a working UDP road hears something all the time).
 		best := alive[0]
 		for _, e := range alive[1:] {
-			if rank(e) < rank(best) {
+			if e.lastRecv.After(best.lastRecv) {
+				best = e
+			}
+		}
+		for _, e := range alive {
+			if rank(e) < rank(best) && best.lastRecv.Sub(e.lastRecv) < 500*time.Millisecond {
 				best = e
 			}
 		}

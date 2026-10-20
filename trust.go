@@ -137,5 +137,14 @@ func (t *Trust) saveLocked() {
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Addr < list[j].Addr })
 	b, _ := json.MarshalIndent(list, "", "  ")
-	_ = os.WriteFile(t.path, b, 0o600)
+	writeAtomic(t.path, b)
+}
+
+// writeAtomic replaces a file in one step: another process (or a restarted node) reading it
+// never sees it half-written.
+func writeAtomic(path string, b []byte) {
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		_ = os.Rename(tmp, path)
+	}
 }

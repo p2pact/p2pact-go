@@ -64,9 +64,10 @@ type stream struct {
 	lastCut        time.Time
 	// delivery rate, as in BBR: bytes acknowledged per second, the maximum of recent samples;
 	// in flight we keep at most what the link delivers in two round trips
-	delivered int64
-	bw        float64
-	bwAt      time.Time
+	delivered     int64
+	inflightBytes int64
+	bw            float64
+	bwAt          time.Time
 
 	recvNext   uint32 // the number we expect next (from 1)
 	early      map[uint32]*part
@@ -97,18 +98,20 @@ func (s *stream) rate(now time.Time, r float64) {
 	}
 }
 
-// window is how many parts may be in flight: the congestion window, capped by twice the
+// canSend tells whether one more part may go: the congestion window, capped by twice the
 // bandwidth-delay product while a queue is building (the round trip has grown well above
 // its minimum). Without a queue the rate samples may come from small messages that never
 // filled the link, so they must not hold it back.
-func (s *stream) window() int {
-	w := int(s.cwnd)
+func (s *stream) canSend() bool {
+	if len(s.inflight) >= int(s.cwnd) {
+		return false
+	}
 	queue := s.srtt > s.minRTT+max(s.minRTT/2, 10*time.Millisecond)
 	if queue && s.bw > 0 && s.minRTT > 0 {
-		bdp := int(2*s.bw*s.minRTT.Seconds()/float64(maxPart)) + 4
-		w = min(w, max(bdp, 4))
+		// in bytes, not parts: under load parts are small
+		return s.inflightBytes < int64(2*s.bw*s.minRTT.Seconds())+4*maxPart
 	}
-	return w
+	return true
 }
 
 // timeout is when a part is due for retransmission: the current estimate (not the one at
@@ -177,7 +180,7 @@ func (s *stream) reset() {
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].seq < pending[j].seq })
 	pending = append(pending, s.queue...)
-	s.next, s.inflight, s.queue = 1, map[uint32]*part{}, nil
+	s.next, s.inflight, s.queue, s.inflightBytes = 1, map[uint32]*part{}, nil, 0
 	for _, p := range pending {
 		p.seq, p.first, p.sent, p.tries = s.next, time.Time{}, time.Time{}, 0
 		s.next++
@@ -218,10 +221,11 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 	if p != nil {
 		retry = true
 		s.lost(now)
-	} else if len(s.queue) > 0 && len(s.inflight) < s.window() {
+	} else if len(s.queue) > 0 && s.canSend() {
 		p = s.queue[0]
 		s.queue = s.queue[1:]
 		s.inflight[p.seq] = p
+		s.inflightBytes += int64(len(p.data))
 	}
 	ack := s.recvNext > 1 && (p != nil || forceAck || (!s.ackDue.IsZero() && !now.Before(s.ackDue)))
 	if p == nil && !ack {
@@ -296,6 +300,7 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 				}
 			}
 			delete(s.inflight, seq)
+			s.inflightBytes -= int64(len(p.data))
 			done++
 		}
 		for seq := range s.inflight {
