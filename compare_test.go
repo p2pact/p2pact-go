@@ -30,8 +30,8 @@ const tlsOverhead = 22
 func ourBytes(msg []any) int {
 	b, _ := cbor.Marshal(msg)
 	s := newStream()
-	s.recvNext = 2 // something to ack, as in a live conversation
-	s.push(b, false)
+	s.recvAck = 2 // something to ack, as in a live conversation
+	s.push(b, false, 0)
 	plain, _ := s.nextPacket(time.Now(), false)
 	return dataHeader + len(plain) + 16
 }

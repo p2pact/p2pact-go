@@ -93,8 +93,9 @@ type peerState struct {
 }
 
 type inbound struct {
-	msg []byte
-	zip bool
+	msg    []byte
+	zip    bool
+	stream uint64
 }
 
 type callResult struct {
@@ -415,8 +416,16 @@ func (n *Node) Forget(addr string) {
 
 // --- calls and events ---
 
-// Call invokes tool.method on a known device and returns the result elements.
+// Call invokes tool.method on a known device and returns the result elements. It goes on
+// stream 0: in order with every other stream-0 message.
 func (n *Node) Call(ctx context.Context, peer string, tool, method int, args ...any) ([]cbor.RawMessage, error) {
+	return n.CallOn(ctx, peer, 0, tool, method, args...)
+}
+
+// CallOn is Call on a stream: in order with the stream's other messages, independent of
+// other streams (a loss on one does not hold up the rest). One stream per chat is natural.
+// The result comes back on the same stream.
+func (n *Node) CallOn(ctx context.Context, peer string, stream uint64, tool, method int, args ...any) ([]cbor.RawMessage, error) {
 	n.mu.Lock()
 	ps := n.peerLocked(peer)
 	if ps == nil {
@@ -429,7 +438,7 @@ func (n *Node) Call(ctx context.Context, peer string, tool, method int, args ...
 	ps.calls[id] = ch
 	msg, err := cbor.Marshal(append([]any{0, id, tool, method}, args...))
 	if err == nil {
-		n.pushLocked(ps, msg)
+		n.pushLocked(ps, msg, stream)
 	}
 	n.mu.Unlock()
 	if err != nil {
@@ -448,8 +457,13 @@ func (n *Node) Call(ctx context.Context, peer string, tool, method int, args ...
 	}
 }
 
-// Event sends event tool.event to a known device (delivered in order, like calls).
+// Event sends event tool.event to a known device on stream 0 (in order, like calls).
 func (n *Node) Event(peer string, tool, event int, args ...any) error {
+	return n.EventOn(peer, 0, tool, event, args...)
+}
+
+// EventOn is Event on a stream (see CallOn).
+func (n *Node) EventOn(peer string, stream uint64, tool, event int, args ...any) error {
 	msg, err := cbor.Marshal(append([]any{3, tool, event}, args...))
 	if err != nil {
 		return err
@@ -460,7 +474,7 @@ func (n *Node) Event(peer string, tool, event int, args ...any) error {
 	if ps == nil {
 		return errors.New("unknown device")
 	}
-	n.pushLocked(ps, msg)
+	n.pushLocked(ps, msg, stream)
 	return nil
 }
 
@@ -598,7 +612,7 @@ func (n *Node) onDataLocked(now time.Time, pkt []byte, from Endpoint) {
 	}
 	ps := n.peerLocked(s.peer)
 	n.seenLocked(ps, from, now, s.local)
-	_ = ps.st.receive(now, plain, func(msg []byte, zip bool) { n.inboundLocked(s.peer, msg, zip) })
+	_ = ps.st.receive(now, plain, func(msg []byte, zip bool, st uint64) { n.inboundLocked(s.peer, msg, zip, st) })
 	if !ps.st.ackDue.IsZero() && !now.Before(ps.st.ackDue) {
 		n.wakeLocked() // an ack is due now
 	}
@@ -640,7 +654,7 @@ func (n *Node) onInitLocked(now time.Time, pkt []byte, from Endpoint) {
 	out := put32(put32([]byte{pResp}, s.remote), local)
 	_ = from.Road.Send(from.Addr, append(out, resp...))
 	if len(payload) > 12 { // data in the first packet
-		_ = ps.st.receive(now, payload[12:], func(msg []byte, zip bool) { n.inboundLocked(peer, msg, zip) })
+		_ = ps.st.receive(now, payload[12:], func(msg []byte, zip bool, st uint64) { n.inboundLocked(peer, msg, zip, st) })
 	}
 	n.sendInfoLocked(peer)
 }
@@ -800,11 +814,11 @@ func (n *Node) bootLocked(ps *peerState, boot uint32) {
 // sendInfoLocked sends our hello: name and where to find us (event 0.2).
 func (n *Node) sendInfoLocked(peer string) {
 	msg, _ := cbor.Marshal(append([]any{3, 0, 2}, n.infoLocked()...))
-	n.pushLocked(n.peerLocked(peer), msg)
+	n.pushLocked(n.peerLocked(peer), msg, 0)
 }
 
 // messageLocked handles a reassembled message (spec §6).
-func (n *Node) messageLocked(peer string, msg []byte) {
+func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 	var a []cbor.RawMessage
 	if cbor.Unmarshal(msg, &a) != nil || len(a) < 2 {
 		return
@@ -842,7 +856,7 @@ func (n *Node) messageLocked(peer string, msg []byte) {
 			b, _ := cbor.Marshal(out)
 			n.mu.Lock()
 			if ps := n.peerLocked(peer); ps != nil {
-				n.pushLocked(ps, b)
+				n.pushLocked(ps, b, stream) // the result goes back on the call's stream
 			}
 			n.mu.Unlock()
 		}()
@@ -1211,18 +1225,18 @@ func (n *Node) wakeLocked() {
 // pushLocked queues a message, compressed with the newest common dictionary when worth it.
 // The slot refers to our list at send time: the list changes only through event 0.5, which
 // travels in the same order as messages.
-func (n *Node) pushLocked(ps *peerState, msg []byte) {
+func (n *Node) pushLocked(ps *peerState, msg []byte, stream uint64) {
 	defer n.wakeLocked()
 	d, slot := n.dicts.pick(ps.dicts, ps.lacks)
 	if n.NoCompression {
-		ps.st.push(msg, false)
+		ps.st.push(msg, false, stream)
 		return
 	}
 	if z := compress(msg, d, slot); z != nil {
-		ps.st.push(z, true)
+		ps.st.push(z, true, stream)
 		return
 	}
-	ps.st.push(msg, false)
+	ps.st.push(msg, false, stream)
 }
 
 // inboundLocked decompresses a reassembled message and runs it in order. A missing
@@ -1230,19 +1244,19 @@ func (n *Node) pushLocked(ps *peerState, msg []byte) {
 // for the dictionary; if we do not know the sender's list yet (it restarted), we wait for its
 // hello. While waiting, only replies to our calls (the dictionary among them), hellos and
 // dictionary lists run out of order: nothing depends on their order.
-func (n *Node) inboundLocked(peer string, msg []byte, zip bool) {
+func (n *Node) inboundLocked(peer string, msg []byte, zip bool, stream uint64) {
 	ps := n.peerLocked(peer)
 	if ps == nil {
 		return
 	}
 	if len(ps.waiting) > 0 {
 		if plain, err := n.unzipLocked(ps, msg, zip); err == nil && outOfOrder(plain) {
-			n.messageLocked(peer, plain)
+			n.messageLocked(peer, plain, stream)
 			n.drainLocked(peer, ps)
 			return
 		}
 	}
-	ps.waiting = append(ps.waiting, inbound{msg, zip})
+	ps.waiting = append(ps.waiting, inbound{msg, zip, stream})
 	n.drainLocked(peer, ps)
 }
 
@@ -1260,7 +1274,7 @@ func (n *Node) drainLocked(peer string, ps *peerState) {
 		}
 		ps.waiting = ps.waiting[1:]
 		if err == nil {
-			n.messageLocked(peer, plain)
+			n.messageLocked(peer, plain, w.stream)
 		}
 	}
 	ps.waiting = nil
@@ -1368,7 +1382,7 @@ func (n *Node) addDictLocked(d *Dict) error {
 	msg, _ := cbor.Marshal([]any{3, 0, 5, n.dicts.ids()})
 	for _, p := range n.Trust.List() {
 		if ps := n.peerLocked(p.Addr); ps != nil {
-			ps.st.push(msg, false)
+			ps.st.push(msg, false, 0)
 		}
 	}
 	n.wakeLocked()

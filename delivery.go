@@ -3,49 +3,61 @@ package p2pact
 import (
 	"encoding/binary"
 	"errors"
-	mbits "math/bits"
 	"sort"
 	"time"
 )
 
 // Delivery (spec §5). The decrypted content of a data packet:
 //
-//	flags (1) | [ack: varint "all up to N" + varint bitmap of the 32 parts after N+1] | [varint part number | part]
+//	flags (1) | [ack] | [varint part number | [varint stream | varint number in stream] | part]
+//	ack = varint "all up to N" | varint count | count × (varint missing, varint received)
 //
-// A message is cut into packet-sized parts numbered consecutively; the receiver reassembles
-// them in order. Anything unacknowledged is retransmitted while the session lives.
+// A message is cut into packet-sized parts numbered consecutively. Messages on stream 0 are
+// delivered in the order sent; a message on another stream (a chat, say) is delivered as soon
+// as it is complete and its stream's earlier messages are delivered — a loss on one stream
+// does not hold up the others. Anything unacknowledged is retransmitted while the session
+// lives. The ack lists the ranges received above the first gap, so many messages in flight
+// past a loss are all acknowledged.
 const (
-	fAck  = 1  // carries an ack
-	fMsg  = 2  // carries a message part
-	fMore = 4  // more parts follow
-	fZip  = 8  // compressed (compress.go); set on every part of a compressed message
-	fOnce = 16 // do not ack (keepalive)
+	fAck   = 1  // carries an ack
+	fMsg   = 2  // carries a message part
+	fMore  = 4  // more parts follow
+	fZip   = 8  // compressed (compress.go); set on every part of a compressed message
+	fOnce  = 16 // do not ack (keepalive)
+	fFirst = 32 // the first part of a message on a stream: stream and its number follow
+	fCont  = 64 // a further part of a message on a stream
 )
 
+// ackBudget is the room for an ack in a packet; ranges beyond it are left out.
+const ackBudget = 60
+
 // maxPart is the message part per packet: 1200 − 9 (header) − 16 (tag) − 1 (flags) −
-// up to 10 (ack) − up to 5 (number).
-const maxPart = MaxPacket - dataHeader - 16 - 1 - 10 - 5
+// the ack − up to 5 (part number) − up to 20 (stream and number).
+const maxPart = MaxPacket - dataHeader - 16 - 1 - ackBudget - 5 - 20
 
 const (
 	rtoStart  = 500 * time.Millisecond // before the first round-trip sample
 	rtoMin    = 50 * time.Millisecond
 	rtoMax    = 4 * time.Second
 	ackDelay  = 40 * time.Millisecond
-	cwndStart = 32   // parts in flight at first
-	cwndMin   = 32   // never below (the old fixed window)
-	cwndMax   = 4096 // ~4.5 MB in flight
-	earlyMax  = 512
+	cwndStart = 32       // parts in flight at first
+	cwndMin   = 32       // never below (the old fixed window)
+	cwndMax   = 4096     // ~4.5 MB in flight
+	gotMax    = 8192     // parts held above the first gap
 	msgMax    = 16 << 20 // longer messages abort reassembly
 )
 
 type part struct {
-	seq   uint32
-	data  []byte
-	more  bool
-	zip   bool
-	first time.Time // first sent at (zero — not sent yet)
-	sent  time.Time
-	tries int
+	seq       uint32
+	data      []byte
+	more      bool
+	zip       bool
+	stream    uint64    // 0 — the ordered default stream
+	num       uint64    // message number in its stream (from 1), on the first part
+	first     bool      // first part of a message on a stream
+	firstSent time.Time // first sent at (zero — not sent yet)
+	sent      time.Time
+	tries     int
 	// bytes delivered when this part was sent: its ack gives a delivery-rate sample
 	delivered int64
 }
@@ -70,17 +82,47 @@ type stream struct {
 	bw            float64
 	bwAt          time.Time
 
-	recvNext   uint32 // the number we expect next (from 1)
-	early      map[uint32]*part
-	assembling []byte
-	zipped     bool      // the message being assembled is compressed
-	ackDue     time.Time // when to ack (zero — nothing to ack)
-	unacked    int       // parts received since our last ack
+	snext map[uint64]uint64 // last message number sent per stream
+
+	recvAck uint32            // the first part not received yet (all before it arrived)
+	got     map[uint32]*rpart // parts received from recvAck on, and earlier ones not yet used
+	next0   uint32            // the next part to take for stream 0
+	asm0    []byte            // stream 0 message being assembled
+	zip0    bool
+	streams map[uint64]*rstream
+	ackDue  time.Time // when to ack (zero — nothing to ack)
+	unacked int       // parts received since our last ack
+}
+
+type rpart struct {
+	data                       []byte
+	more, zip, first, streamed bool
+	used                       bool
+	stream, num                uint64
+}
+
+// rstream holds complete messages of one stream until their turn.
+type rstream struct {
+	next  uint64
+	ready map[uint64]readyMsg
+}
+
+type readyMsg struct {
+	msg []byte
+	zip bool
 }
 
 func newStream() *stream {
-	return &stream{next: 1, recvNext: 1, inflight: map[uint32]*part{}, early: map[uint32]*part{},
-		cwnd: cwndStart, ssthresh: cwndMax}
+	s := &stream{next: 1, inflight: map[uint32]*part{}, cwnd: cwndStart, ssthresh: cwndMax}
+	s.resetRecv()
+	return s
+}
+
+func (s *stream) resetRecv() {
+	s.snext = map[uint64]uint64{}
+	s.recvAck, s.next0, s.got, s.asm0, s.zip0 = 1, 1, map[uint32]*rpart{}, nil, false
+	s.streams = map[uint64]*rstream{}
+	s.ackDue, s.unacked = time.Time{}, 0
 }
 
 // rto is the retransmission timeout for a part sent for the first time.
@@ -110,8 +152,7 @@ func (s *stream) canSend() bool {
 	if len(s.inflight) >= int(s.cwnd) {
 		return false
 	}
-	queue := s.srtt > s.minRTT+max(s.minRTT/2, 10*time.Millisecond)
-	if queue && s.bw > 0 && s.minRTT > 0 {
+	if s.queueing() && s.bw > 0 && s.minRTT > 0 {
 		// in bytes, not parts: under load parts are small
 		return s.inflightBytes < int64(2*s.bw*s.minRTT.Seconds())+4*maxPart
 	}
@@ -155,9 +196,10 @@ func (s *stream) sample(rtt time.Duration) {
 
 // acked grows the window for n newly acknowledged parts.
 func (s *stream) acked(n int) {
+	queue := s.queueing()
 	for i := 0; i < n; i++ {
-		if s.cwnd < s.ssthresh {
-			s.cwnd++ // slow start: doubles every round trip
+		if s.cwnd < s.ssthresh || !queue {
+			s.cwnd++ // slow start, and while no queue builds (as BBR probes): doubles every round trip
 		} else {
 			s.cwnd += 1 / s.cwnd
 		}
@@ -165,9 +207,16 @@ func (s *stream) acked(n int) {
 	s.cwnd = min(s.cwnd, cwndMax)
 }
 
-// lost halves the window, at most once per round trip.
+// queueing reports that the round trip has grown well above its minimum: a queue is building
+// somewhere on the path.
+func (s *stream) queueing() bool {
+	return s.srtt > s.minRTT+max(s.minRTT/2, 10*time.Millisecond)
+}
+
+// lost halves the window, at most once per round trip — but only when a queue builds: a loss
+// without one is random (radio, a busy Wi-Fi) and says nothing about congestion.
 func (s *stream) lost(now time.Time) {
-	if now.Sub(s.lastCut) < max(s.srtt, rtoMin) {
+	if now.Sub(s.lastCut) < max(s.srtt, rtoMin) || !s.queueing() {
 		return
 	}
 	s.lastCut = now
@@ -185,19 +234,34 @@ func (s *stream) reset() {
 	sort.Slice(pending, func(i, j int) bool { return pending[i].seq < pending[j].seq })
 	pending = append(pending, s.queue...)
 	s.next, s.inflight, s.queue, s.inflightBytes = 1, map[uint32]*part{}, nil, 0
+	s.resetRecv()
 	for _, p := range pending {
-		p.seq, p.first, p.sent, p.tries = s.next, time.Time{}, time.Time{}, 0
+		p.seq, p.firstSent, p.sent, p.tries = s.next, time.Time{}, time.Time{}, 0
 		s.next++
+		if p.first { // the other side expects each stream from message 1 again
+			s.snext[p.stream]++
+			p.num = s.snext[p.stream]
+		}
 		s.queue = append(s.queue, p)
 	}
-	s.recvNext, s.early, s.assembling, s.zipped, s.ackDue = 1, map[uint32]*part{}, nil, false, time.Time{}
 }
 
-// push queues a message in parts; zip marks it compressed.
-func (s *stream) push(msg []byte, zip bool) {
+// push queues a message in parts on a stream (0 — the ordered default); zip marks it
+// compressed.
+func (s *stream) push(msg []byte, zip bool, stream uint64) {
+	var num uint64
+	if stream != 0 {
+		s.snext[stream]++
+		num = s.snext[stream]
+	}
+	first := true
 	for {
 		n := min(len(msg), maxPart)
-		p := &part{seq: s.next, data: msg[:n], more: n < len(msg), zip: zip}
+		p := &part{seq: s.next, data: msg[:n], more: n < len(msg), zip: zip, stream: stream}
+		if stream != 0 && first {
+			p.first, p.num = true, num
+		}
+		first = false
 		s.next++
 		s.queue = append(s.queue, p)
 		msg = msg[n:]
@@ -231,7 +295,8 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 		s.inflight[p.seq] = p
 		s.inflightBytes += int64(len(p.data))
 	}
-	ack := s.recvNext > 1 && (p != nil || forceAck || (!s.ackDue.IsZero() && !now.Before(s.ackDue)))
+	received := s.recvAck > 1 || len(s.got) > 0
+	ack := received && (p != nil || forceAck || (!s.ackDue.IsZero() && !now.Before(s.ackDue)))
 	if p == nil && !ack {
 		return nil, false
 	}
@@ -239,14 +304,7 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 	b := []byte{0}
 	if ack {
 		flags |= fAck
-		b = binary.AppendUvarint(b, uint64(s.recvNext-1))
-		var bits uint64
-		for i := uint32(0); i < 32; i++ {
-			if s.early[s.recvNext+1+i] != nil {
-				bits |= 1 << i
-			}
-		}
-		b = binary.AppendUvarint(b, bits)
+		b = s.appendAck(b)
 		s.ackDue, s.unacked = time.Time{}, 0
 	}
 	if p != nil {
@@ -258,9 +316,17 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 			flags |= fZip
 		}
 		b = binary.AppendUvarint(b, uint64(p.seq))
+		switch {
+		case p.first:
+			flags |= fFirst
+			b = binary.AppendUvarint(b, p.stream)
+			b = binary.AppendUvarint(b, p.num)
+		case p.stream != 0:
+			flags |= fCont
+		}
 		b = append(b, p.data...)
-		if p.first.IsZero() {
-			p.first = now
+		if p.firstSent.IsZero() {
+			p.firstSent = now
 		}
 		p.delivered = s.delivered
 		p.sent = now
@@ -270,12 +336,44 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 	return b, retry
 }
 
+// appendAck writes the ack: all up to recvAck−1, then ranges received above the first gap as
+// (missing, received) counts, as many as fit in ackBudget.
+func (s *stream) appendAck(b []byte) []byte {
+	b = binary.AppendUvarint(b, uint64(s.recvAck-1))
+	var above []uint32
+	for seq := range s.got {
+		if seq > s.recvAck {
+			above = append(above, seq)
+		}
+	}
+	sort.Slice(above, func(i, j int) bool { return above[i] < above[j] })
+	var ranges []byte
+	count, cursor := 0, s.recvAck
+	for i := 0; i < len(above); {
+		j := i
+		for j+1 < len(above) && above[j+1] == above[j]+1 {
+			j++
+		}
+		r := binary.AppendUvarint(nil, uint64(above[i]-cursor))
+		r = binary.AppendUvarint(r, uint64(j-i+1))
+		if len(ranges)+len(r) > ackBudget-12 {
+			break
+		}
+		ranges = append(ranges, r...)
+		count++
+		cursor = above[j] + 1
+		i = j + 1
+	}
+	b = binary.AppendUvarint(b, uint64(count))
+	return append(b, ranges...)
+}
+
 // keepalive is a liveness packet: flags only, not acknowledged.
 func keepalive() []byte { return []byte{fOnce} }
 
 // receive handles packet content from the other device; deliver is called for every
-// reassembled message, in order (zip — compressed).
-func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip bool)) error {
+// message as it becomes deliverable (zip — compressed; stream — the stream it came on).
+func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip bool, stream uint64)) error {
 	if len(b) == 0 {
 		return errors.New("empty packet")
 	}
@@ -285,11 +383,12 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 		if n <= 0 {
 			return errShort
 		}
-		bits, m := binary.Uvarint(b[n:])
-		if m <= 0 {
+		b = b[n:]
+		count, n := binary.Uvarint(b)
+		if n <= 0 || count > 64 {
 			return errShort
 		}
-		b = b[n+m:]
+		b = b[n:]
 		done := 0
 		ack := func(seq uint32) {
 			p := s.inflight[seq]
@@ -312,18 +411,31 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 				ack(seq)
 			}
 		}
-		for i := uint64(0); i < 32; i++ {
-			if bits&(1<<i) != 0 {
-				ack(uint32(upto + 2 + i))
+		beyond, cursor := uint64(0), upto+1
+		for i := uint64(0); i < count; i++ {
+			gap, k := binary.Uvarint(b)
+			if k <= 0 {
+				return errShort
 			}
+			run, m := binary.Uvarint(b[k:])
+			if m <= 0 || run > gotMax {
+				return errShort
+			}
+			b = b[k+m:]
+			start := cursor + gap
+			for seq := start; seq < start+run; seq++ {
+				ack(uint32(seq))
+			}
+			beyond += run
+			cursor = start + run
 		}
 		s.acked(done)
 		// fast retransmit, as TCP after three duplicate acks: three parts after the gap arrived,
 		// so the gap is lost — resend it now instead of waiting for the timer. Fewer than
 		// three may be reordering: wait a quarter of a round trip.
-		if bits != 0 {
+		if beyond > 0 {
 			if p := s.inflight[uint32(upto+1)]; p != nil &&
-				(mbits.OnesCount64(bits) >= 3 || now.Sub(p.sent) >= max(s.srtt/4, ackDelay)) {
+				(beyond >= 3 || now.Sub(p.sent) >= max(s.srtt/4, ackDelay)) {
 				p.sent = time.Time{}
 			}
 		}
@@ -335,51 +447,135 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 	if n <= 0 {
 		return errShort
 	}
-	seq, data := uint32(seq64), b[n:]
+	b = b[n:]
+	r := &rpart{more: flags&fMore != 0, zip: flags&fZip != 0}
+	if flags&fFirst != 0 {
+		st, k := binary.Uvarint(b)
+		if k <= 0 {
+			return errShort
+		}
+		num, m := binary.Uvarint(b[k:])
+		if m <= 0 {
+			return errShort
+		}
+		b = b[k+m:]
+		r.first, r.streamed, r.stream, r.num = true, true, st, num
+	} else if flags&fCont != 0 {
+		r.streamed = true
+	}
+	seq := uint32(seq64)
 	if s.ackDue.IsZero() {
 		s.ackDue = now.Add(ackDelay)
 	}
 	// like TCP: ack at once every second part, and on anything out of order (a gap tells the
 	// sender to retransmit); a lone part waits ackDelay for a reply to ride on
-	if s.unacked++; s.unacked >= 2 || seq != s.recvNext {
+	if s.unacked++; s.unacked >= 2 || seq != s.recvAck {
 		s.ackDue = now
 	}
-	switch {
-	case seq < s.recvNext: // duplicate: already had it, just ack
-		return nil
-	case seq > s.recvNext:
-		if len(s.early) < earlyMax {
-			s.early[seq] = &part{seq: seq, data: append([]byte(nil), data...), more: flags&fMore != 0, zip: flags&fZip != 0}
-		}
-		return nil
+	if seq < s.recvAck || s.got[seq] != nil || len(s.got) >= gotMax {
+		return nil // duplicate (just ack), or too far ahead
 	}
-	s.take(data, flags&fMore != 0, flags&fZip != 0, deliver)
-	for {
-		p := s.early[s.recvNext]
-		if p == nil {
-			return nil
+	r.data = append([]byte(nil), b...)
+	s.got[seq] = r
+	for s.got[s.recvAck] != nil {
+		s.recvAck++
+	}
+	if r.streamed {
+		s.assemble(seq, deliver)
+	}
+	s.take0(deliver)
+	for seq, x := range s.got { // forget parts that are used and acknowledged
+		if x.used && seq < s.recvAck && seq < s.next0 {
+			delete(s.got, seq)
 		}
-		delete(s.early, s.recvNext)
-		s.take(p.data, p.more, p.zip, deliver)
+	}
+	return nil
+}
+
+// assemble completes the stream message part seq belongs to, if all its parts are here, and
+// delivers what its stream allows.
+func (s *stream) assemble(seq uint32, deliver func([]byte, bool, uint64)) {
+	start := seq
+	for {
+		x := s.got[start]
+		if x == nil || x.used {
+			return
+		}
+		if x.first {
+			break
+		}
+		if !x.streamed || start == 0 {
+			return
+		}
+		start--
+	}
+	head := s.got[start]
+	var msg []byte
+	end := start
+	for {
+		x := s.got[end]
+		if x == nil || !x.streamed || x.used || (end != start && x.first) {
+			return // a part is still missing
+		}
+		if len(msg)+len(x.data) > msgMax {
+			return
+		}
+		msg = append(msg, x.data...)
+		if !x.more {
+			break
+		}
+		end++
+	}
+	for k := start; k <= end; k++ {
+		s.got[k].used = true
+	}
+	st := s.streams[head.stream]
+	if st == nil {
+		st = &rstream{next: 1, ready: map[uint64]readyMsg{}}
+		s.streams[head.stream] = st
+	}
+	if head.num < st.next {
+		return // a duplicate of a delivered message
+	}
+	st.ready[head.num] = readyMsg{msg, head.zip}
+	for {
+		m, ok := st.ready[st.next]
+		if !ok {
+			return
+		}
+		delete(st.ready, st.next)
+		st.next++
+		deliver(m.msg, m.zip, head.stream)
 	}
 }
 
-func (s *stream) take(data []byte, more, zip bool, deliver func([]byte, bool)) {
-	s.recvNext++
-	if len(s.assembling) == 0 {
-		s.zipped = zip
+// take0 delivers stream 0 messages in order; parts of stream messages are skipped.
+func (s *stream) take0(deliver func([]byte, bool, uint64)) {
+	for {
+		x := s.got[s.next0]
+		if x == nil {
+			return
+		}
+		s.next0++
+		if x.streamed {
+			continue
+		}
+		x.used = true
+		if len(s.asm0) == 0 {
+			s.zip0 = x.zip
+		}
+		if len(s.asm0)+len(x.data) > msgMax {
+			s.asm0 = nil
+			continue
+		}
+		s.asm0 = append(s.asm0, x.data...)
+		if x.more {
+			continue
+		}
+		msg := s.asm0
+		s.asm0 = nil
+		deliver(msg, s.zip0, 0)
 	}
-	if len(s.assembling)+len(data) > msgMax {
-		s.assembling = nil
-		return
-	}
-	s.assembling = append(s.assembling, data...)
-	if more {
-		return
-	}
-	msg := s.assembling
-	s.assembling = nil
-	deliver(msg, s.zipped)
 }
 
 // idle reports that nothing waits to be sent or acknowledged.
