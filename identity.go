@@ -1,4 +1,4 @@
-// Package p2pact is the reference implementation of the P2P Agent Chat Protocol (https://github.com/p2pact/p2pact):
+// Package p2pact is the reference implementation of the P2P Agent Chat Transport Protocol (https://github.com/p2pact/p2pact):
 // device keys, pairing by invite, Noise sessions over any road, delivery with
 // acknowledgements, CBOR messages and dictionary compression.
 //
