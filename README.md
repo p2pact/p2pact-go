@@ -36,6 +36,10 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
 ```
 
 - `Call` / `Handle` — calls and results; `Event` / `OnEvent` — events in either direction.
+- `CallOn` / `EventOn` — the same on a **stream**: in order within it, independent of other
+  streams, so a loss on one chat does not hold up the others. Use one stream per chat.
+- `SetAdvertise` — announce given addresses instead of your own (port forwarding, a public
+  address).
 - `AddDict` — a compression dictionary (spec §5); a missing one is fetched from the sender.
 - `Befriend` — add a device known from the family book without pairing.
 - `SetRelay` — your relay for when devices cannot reach each other directly.
@@ -44,8 +48,9 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
 
 - Pairing by invite (Noise XXpsk2), sessions with data in the first packet (Noise IK).
 - Roads: UDP, TCP, relay. A session moves between roads without a new handshake.
-- Delivery: piggybacked acks, retransmission over the next live road, long messages in parts,
-  zstd with dictionaries.
+- Delivery: streams, ack ranges, congestion control (a window that grows while no queue
+  builds, timers from the measured round trip, a delivery-rate limit), retransmission over
+  the next live road, long messages in parts, zstd with dictionaries.
 - Not yet: the family tool, Bluetooth, NAT hole punching.
 
 ## Relay
