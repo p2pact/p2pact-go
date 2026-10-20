@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1047,14 +1048,22 @@ func (n *Node) sendLocked(now time.Time, peer string, ps *peerState, s *session,
 // startInitLocked starts a session with a known device (Noise_IK); first is first-packet data.
 func (n *Node) startInitLocked(now time.Time, peer string, ps *peerState, first []byte) {
 	p := n.Trust.Get(peer)
-	if p == nil || now.Sub(ps.lastInit) < initEvery {
+	if p == nil || now.Sub(ps.lastInit) < ps.initGap() {
 		return
 	}
 	ps.lastInit = now
-	for idx, h := range n.hs { // forget earlier unanswered starts to this device
+	// keep the last few unanswered starts: a reply to any of them opens the session (on a
+	// slow link the reply to an earlier one may come after we retried)
+	var pending []uint32
+	for idx, h := range n.hs {
 		if !h.pair && h.peer == peer {
-			delete(n.hs, idx)
+			pending = append(pending, idx)
 		}
+	}
+	sort.Slice(pending, func(i, j int) bool { return n.hs[pending[i]].at.Before(n.hs[pending[j]].at) })
+	for len(pending) >= 3 {
+		delete(n.hs, pending[0])
+		pending = pending[1:]
 	}
 	hs, err := noise.NewHandshakeState(noise.Config{CipherSuite: suite, Pattern: noise.HandshakeIK, Initiator: true,
 		Prologue: []byte(Prologue), StaticKeypair: n.ID.Key, PeerStatic: p.Key})
@@ -1085,7 +1094,7 @@ func (n *Node) pumpLocked(now time.Time) {
 		if s == nil {
 			// take a part for the first packet only when a handshake really goes out:
 			// otherwise it would count as sent and wait for its retransmission timer
-			if !ps.st.idle() && now.Sub(ps.lastInit) >= initEvery && n.Trust.Get(peer) != nil {
+			if !ps.st.idle() && now.Sub(ps.lastInit) >= ps.initGap() && n.Trust.Get(peer) != nil {
 				first, _ := ps.st.nextPacket(now, false)
 				n.startInitLocked(now, peer, ps, first)
 			}
@@ -1121,6 +1130,15 @@ func (n *Node) pumpLocked(now time.Time) {
 			}
 		}
 	}
+}
+
+// initGap is how long to wait for a handshake reply before retrying: three round trips as
+// last measured with this device (250 ms – 2 s), a second when unknown (like TCP and QUIC).
+func (ps *peerState) initGap() time.Duration {
+	if ps.st.srtt == 0 {
+		return initEvery
+	}
+	return min(max(3*ps.st.srtt, 250*time.Millisecond), 2*time.Second)
 }
 
 func (n *Node) stuckLocked(ps *peerState) bool {
