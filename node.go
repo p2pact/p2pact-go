@@ -113,6 +113,8 @@ type Node struct {
 	OnHello func(peer string)
 	// NoCompression turns compression off for what we send (benchmarks, debugging).
 	NoCompression bool
+
+	advertise *Hints // announced instead of our own addresses (SetAdvertise)
 	// AllowDict decides whether a known device may fetch a dictionary (0.5); nil — all may.
 	AllowDict func(peer string, id []byte) bool
 
@@ -498,7 +500,23 @@ func (n *Node) infoLocked() []any {
 	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(), toWire(n.hintsLocked())}
 }
 
+// SetAdvertise announces these addresses instead of our own in invites and hellos: behind
+// port forwarding, a known public address, or a proxy. nil — our own addresses again.
+func (n *Node) SetAdvertise(h *Hints) {
+	n.mu.Lock()
+	n.advertise = h
+	n.mu.Unlock()
+}
+
 func (n *Node) hintsLocked() Hints {
+	if n.advertise != nil {
+		h := *n.advertise
+		if h.Relay == nil && n.own != nil {
+			cp := *n.own
+			h.Relay = &cp
+		}
+		return h
+	}
 	var h Hints
 	if n.udp != nil {
 		h.UDP = n.udp.localAddrs()
