@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 func chatLine(i int) []byte {
@@ -224,4 +226,30 @@ func TestTrainInLull(t *testing.T) {
 		t.Fatal("a trained in the middle of the conversation")
 	}
 	waitFor(t, a, "a did not train in the lull", func() bool { return a.dicts.own(b.ID.Addr()) != nil })
+}
+
+// A device that only receives trains nothing: the dictionary is for what it sends.
+func TestNoDictForListener(t *testing.T) {
+	lull := learnLull
+	learnLull = 300 * time.Millisecond
+	defer func() { learnLull = lull }()
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	b.Handle(64, 2, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // answers nothing worth compressing
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for i := range 300 {
+		if _, err := a.Call(ctx, b.ID.Addr(), 64, 2, chatLine(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, a, "a did not train", func() bool { return a.dicts.own(b.ID.Addr()) != nil })
+	time.Sleep(3 * learnLull)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.dicts.own(a.ID.Addr()) != nil {
+		t.Fatal("b trained a dictionary on what it only received")
+	}
 }

@@ -172,6 +172,10 @@ var (
 // needs what the conversation is like, not every message of it.
 const learnQueueMax = 1 << 20
 
+// learnOwnMin: a device that sends (almost) nothing worth compressing has no use for a
+// dictionary of its own, however much it receives.
+const learnOwnMin = 8
+
 type pending struct {
 	msg         []byte // not copied: a message is not changed once sent or received
 	heard       bool
@@ -272,7 +276,7 @@ func (n *Node) considerLocked(ps *peerState, h *history, now time.Time) {
 			h.worse = true
 		}
 	}
-	if h.due == "" {
+	if h.due == "" && len(h.own) >= learnOwnMin {
 		switch {
 		case own == nil:
 			if size >= max(learnFirst, 2*h.trained) { // trained: a try that failed
