@@ -24,7 +24,8 @@ const zipMin = 64
 // the few percent of bytes it saves.
 const zipFastFrom = 32 << 10
 
-// dictKeep is how many dictionaries to keep: new ones and those still in flight.
+// dictKeep is how many dictionaries of one kind to keep (common ones, ours for a device,
+// a device's own): new ones and those still in flight.
 const dictKeep = 4
 
 var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
@@ -34,6 +35,10 @@ type Dict struct {
 	ID  []byte
 	Raw []byte
 	zid uint32 // dictionary id inside zstd (from its header; 0 for a raw one)
+	// peer: "" — a common dictionary, anyone may have it; otherwise it belongs to the pair
+	// with this device and is never shown or given to another. own: we trained it (for peer).
+	peer string
+	own  bool
 
 	once sync.Once
 	enc  *zstd.Encoder
@@ -59,8 +64,10 @@ func NewDict(raw []byte) (*Dict, error) {
 
 func (d *Dict) init() error {
 	d.once.Do(func() {
+		// not the best level: with a dictionary it costs ~30× the time (0.6 ms a message, under
+		// the node's lock) for ~3 % fewer bytes
 		d.enc, d.err = zstd.NewWriter(nil, zstd.WithEncoderDict(d.Raw), zstd.WithEncoderCRC(false),
-			zstd.WithEncoderLevel(zstd.SpeedBestCompression), zstd.WithEncoderConcurrency(1))
+			zstd.WithEncoderLevel(zstd.SpeedBetterCompression), zstd.WithEncoderConcurrency(1))
 		if d.err == nil {
 			d.fast, d.err = zstd.NewWriter(nil, zstd.WithEncoderDict(d.Raw), zstd.WithEncoderCRC(false),
 				zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
@@ -180,82 +187,224 @@ func restoreFrame(f []byte, zid uint32) []byte {
 	return append(out, f[at:]...)
 }
 
-// --- storage: dir/net-dicts/<id hex>; the order (newest first) is in the file "order" ---
+// --- storage: dir/net-dicts/<id hex>; the order (newest first) is in the file "order",
+// a line per dictionary: "<id hex>" for a common one, "<id hex> <device> own|their" for a pair's.
 
 type dictStore struct {
 	dir   string
 	dicts []*Dict // newest first
+	// slots: what we list to each device, by slot. A dictionary keeps its slot while listed
+	// (a message compressed with it may still be on its way on another stream, behind the new
+	// list); a dropped one leaves an empty id, and a new one goes to the end.
+	slots map[string][][]byte
 }
 
+// slotsMax: past this many slots, a new dictionary takes the oldest empty one.
+const slotsMax = 32
+
 func loadDicts(dir string) *dictStore {
-	s := &dictStore{dir: filepath.Join(dir, "net-dicts")}
+	s := &dictStore{dir: filepath.Join(dir, "net-dicts"), slots: map[string][][]byte{}}
 	b, _ := os.ReadFile(filepath.Join(s.dir, "order"))
-	for _, h := range strings.Fields(string(b)) {
-		raw, err := os.ReadFile(filepath.Join(s.dir, h))
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 1 && len(f) != 3 { // a damaged line: never take a pair's dictionary for a common one
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(s.dir, f[0]))
 		if err != nil {
 			continue
 		}
 		d, err := NewDict(raw)
-		if err != nil || hexs(d.ID) != h {
+		if err != nil || hexs(d.ID) != f[0] {
 			continue
+		}
+		if len(f) == 3 {
+			d.peer, d.own = f[1], f[2] == "own"
 		}
 		s.dicts = append(s.dicts, d)
 	}
 	return s
 }
 
-func (s *dictStore) get(id []byte) *Dict {
+// visible reports whether d may be used with, listed to or given to peer.
+func (d *Dict) visible(peer string) bool { return d.peer == "" || d.peer == peer }
+
+// get returns dictionary id if peer may see it.
+func (s *dictStore) get(id []byte, peer string) *Dict {
 	for _, d := range s.dicts {
-		if bytes.Equal(d.ID, id) {
+		if bytes.Equal(d.ID, id) && d.visible(peer) {
 			return d
 		}
 	}
 	return nil
 }
 
-// add puts a dictionary first (moving it up if known) and deletes the oldest extra ones.
+// add puts a dictionary first (moving it up if known) and deletes the oldest extra ones of
+// its kind.
 func (s *dictStore) add(d *Dict) error {
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return err
 	}
-	h := hexs(d.ID)
-	if err := os.WriteFile(filepath.Join(s.dir, h), d.Raw, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(s.dir, hexs(d.ID)), d.Raw, 0o600); err != nil {
 		return err
 	}
-	out := []*Dict{d}
+	out, dropped := []*Dict{d}, []*Dict{}
+	kinds := map[[2]any]int{{d.peer, d.own}: 1}
 	for _, x := range s.dicts {
-		if !bytes.Equal(x.ID, d.ID) {
-			out = append(out, x)
+		if bytes.Equal(x.ID, d.ID) && x.peer == d.peer {
+			continue
+		}
+		k := [2]any{x.peer, x.own}
+		if kinds[k]++; kinds[k] > dictKeep {
+			dropped = append(dropped, x)
+			continue
+		}
+		out = append(out, x)
+	}
+	for _, x := range dropped {
+		if !s.listed(out, x.ID) { // one file serves the same bytes kept as another kind
+			_ = os.Remove(filepath.Join(s.dir, hexs(x.ID)))
 		}
 	}
-	for _, x := range out[min(len(out), dictKeep):] {
-		_ = os.Remove(filepath.Join(s.dir, hexs(x.ID)))
-	}
-	s.dicts = out[:min(len(out), dictKeep)]
-	var ids []string
-	for _, x := range s.dicts {
-		ids = append(ids, hexs(x.ID))
-	}
-	return os.WriteFile(filepath.Join(s.dir, "order"), []byte(strings.Join(ids, "\n")+"\n"), 0o600)
+	s.dicts = out
+	return s.saveOrder()
 }
 
-func (s *dictStore) ids() [][]byte {
-	out := make([][]byte, 0, len(s.dicts))
+// saveOrder writes the file "order" (through a temporary file: a torn one could turn a pair's
+// dictionary into a common one, though loading skips damaged lines too).
+func (s *dictStore) saveOrder() error {
+	var lines []string
+	for _, x := range s.dicts {
+		line := hexs(x.ID)
+		if x.peer != "" {
+			line += " " + x.peer + map[bool]string{true: " own", false: " their"}[x.own]
+		}
+		lines = append(lines, line)
+	}
+	return writeFileAtomic(filepath.Join(s.dir, "order"), []byte(strings.Join(lines, "\n")+"\n"))
+}
+
+func writeFileAtomic(path string, b []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// list is what peer sees of our dictionaries, newest first: the common ones and the pair's.
+func (s *dictStore) list(peer string) []*Dict {
+	var out []*Dict
 	for _, d := range s.dicts {
-		out = append(out, d.ID)
+		if d.visible(peer) && !s.listed(out, d.ID) {
+			out = append(out, d)
+		}
 	}
 	return out
 }
 
-// pick returns our newest dictionary that the receiver also has (its list is theirs, minus
-// lacks) and its slot in our list (from 1). Nothing in common: no dictionary, slot 0.
-func (s *dictStore) pick(theirs, lacks [][]byte) (*Dict, int) {
-	for i, d := range s.dicts {
-		if has(theirs, d.ID) && !has(lacks, d.ID) {
-			return d, i + 1
+func (s *dictStore) listed(list []*Dict, id []byte) bool {
+	for _, d := range list {
+		if bytes.Equal(d.ID, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// ids is our list for peer, by slot (an empty id — a free slot).
+func (s *dictStore) ids(peer string) [][]byte {
+	list := s.list(peer)
+	slots := s.slots[peer]
+	for i, id := range slots {
+		if len(id) > 0 && !s.listed(list, id) {
+			slots[i] = []byte{}
+		}
+	}
+	for j := len(list) - 1; j >= 0; j-- { // the oldest first, so the newest gets the last slot
+		d := list[j]
+		if has(slots, d.ID) {
+			continue
+		}
+		free := -1
+		if len(slots) >= slotsMax {
+			for i, id := range slots {
+				if len(id) == 0 {
+					free = i
+					break
+				}
+			}
+		}
+		if free < 0 {
+			slots = append(slots, d.ID)
+		} else {
+			slots[free] = d.ID
+		}
+	}
+	s.slots[peer] = slots
+	return append([][]byte(nil), slots...)
+}
+
+// slotOf is d's slot in our list for peer (from 1).
+func (s *dictStore) slotOf(peer string, d *Dict) int {
+	for i, id := range s.ids(peer) {
+		if bytes.Equal(id, d.ID) {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// own returns our newest dictionary trained for peer, nil if none.
+func (s *dictStore) own(peer string) *Dict {
+	for _, d := range s.dicts {
+		if d.own && d.peer == peer {
+			return d
+		}
+	}
+	return nil
+}
+
+// pick returns the dictionary to compress for peer and its slot in our list for peer (from
+// 1): ours trained for it if it has it, else the newest it also has (its list is theirs,
+// minus lacks). Nothing in common: no dictionary, slot 0.
+func (s *dictStore) pick(peer string, theirs, lacks [][]byte) (*Dict, int) {
+	list := s.list(peer)
+	ok := func(d *Dict) bool { return has(theirs, d.ID) && !has(lacks, d.ID) }
+	for _, d := range list {
+		if d.own && ok(d) {
+			return d, s.slotOf(peer, d)
+		}
+	}
+	for _, d := range list {
+		if ok(d) {
+			return d, s.slotOf(peer, d)
 		}
 	}
 	return nil, 0
+}
+
+// forget drops what belongs to the pair with peer: our dictionaries for it and its own.
+func (s *dictStore) forget(peer string) {
+	var keep, drop []*Dict
+	for _, d := range s.dicts {
+		if d.peer == peer {
+			drop = append(drop, d)
+		} else {
+			keep = append(keep, d)
+		}
+	}
+	if len(drop) == 0 {
+		return
+	}
+	s.dicts = keep
+	for _, d := range drop {
+		if !s.listed(keep, d.ID) {
+			_ = os.Remove(filepath.Join(s.dir, hexs(d.ID)))
+		}
+	}
+	delete(s.slots, peer)
+	_ = s.saveOrder()
 }
 
 func has(list [][]byte, id []byte) bool {

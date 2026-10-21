@@ -40,7 +40,10 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
   streams, so a loss on one chat does not hold up the others. Use one stream per chat.
 - `SetAdvertise` — announce given addresses instead of your own (port forwarding, a public
   address).
-- `AddDict` — a compression dictionary (spec §5); a missing one is fetched from the sender.
+- `AddDict(p2pact.CommonDict)` — the common compression dictionary (spec §5), used until the
+  device has its own. Its own it trains by itself, one per device it talks to, on that
+  conversation (kept in `net-history/` next to the keys, shown to nobody else); `NoLearning`
+  turns that off, `DictState` tells what compresses messages to a device now.
 - `Befriend` — add a device known from the family book without pairing.
 - `SetRelay` — your relay for when devices cannot reach each other directly.
 
@@ -50,7 +53,10 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
 - Roads: UDP, TCP, relay. A session moves between roads without a new handshake.
 - Delivery: streams, ack ranges, congestion control (a window that grows while no queue
   builds, timers from the measured round trip, a delivery-rate limit), retransmission over
-  the next live road, long messages in parts, zstd with dictionaries.
+  the next live road, long messages in parts.
+- Compression: zstd with the common dictionary and dictionaries each device trains for each
+  device it talks to (fastCover, as `zstd --train`, with the parameters picked on held-out
+  messages).
 - Not yet: the family tool, Bluetooth, NAT hole punching.
 
 ## Relay

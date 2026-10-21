@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -79,6 +80,7 @@ type epState struct {
 }
 
 type peerState struct {
+	addr     string
 	st       *stream
 	eps      map[string]*epState
 	lastTS   uint64 // timestamp of the last accepted handshake start
@@ -90,6 +92,9 @@ type peerState struct {
 	lacks    [][]byte  // it asked us for these, so it lacks them until it announces again
 	waiting  []inbound // waiting for a dictionary (spec §5): run in order once it arrives
 	fetching bool
+	tried    [][]byte        // dictionaries of its list we asked it for and did not get
+	hist     *history        // what we sent it and got from it, to train our dictionary for it
+	sysCalls map[uint64]bool // our calls of tool 0: their results are not conversation
 }
 
 type inbound struct {
@@ -108,6 +113,7 @@ type Node struct {
 	ID    *Identity
 	Trust *Trust
 	Name  string
+	dir   string
 	// OnEvent receives tool events (except tool 0) from known devices.
 	OnEvent func(peer string, tool, event int, args []cbor.RawMessage)
 	// OnPaired is called after pairing (on either side).
@@ -116,6 +122,8 @@ type Node struct {
 	OnHello func(peer string)
 	// NoCompression turns compression off for what we send (benchmarks, debugging).
 	NoCompression bool
+	// NoLearning: do not train our own dictionaries on what we send (spec §5).
+	NoLearning bool
 
 	advertise *Hints // announced instead of our own addresses (SetAdvertise)
 	// AllowDict decides whether a known device may fetch a dictionary (0.5); nil — all may.
@@ -137,9 +145,10 @@ type Node struct {
 	resetAt  map[string]time.Time
 	dicts    *dictStore
 
-	stop chan struct{}
-	kick chan struct{} // something was queued: send now, not on the next tick
-	wg   sync.WaitGroup
+	stop  chan struct{}
+	kick  chan struct{} // something was queued: send now, not on the next tick
+	train chan struct{} // one dictionary is trained at a time
+	wg    sync.WaitGroup
 	// handshakes counts sessions set up (for tests: a network change needs no new one)
 	handshakes atomic.Int64
 }
@@ -150,13 +159,13 @@ func NewNode(dir, name string) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, boot: binary.BigEndian.Uint32(randBytes(4)),
+	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, dir: dir, boot: binary.BigEndian.Uint32(randBytes(4)),
 		rel: map[string]*RelayRoad{}, sessions: map[uint32]*session{}, current: map[string]*session{},
 		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, peers: map[string]*peerState{},
 		handlers: map[[2]int]Handler{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
-		kick: make(chan struct{}, 1)}
+		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
-	n.Handle(0, 2, func(string, []cbor.RawMessage) ([]any, error) { return n.info(), nil })
+	n.Handle(0, 2, func(peer string, _ []cbor.RawMessage) ([]any, error) { return n.info(peer), nil })
 	n.Handle(0, 5, n.dictHandler)
 	return n, nil
 }
@@ -402,9 +411,15 @@ func (n *Node) Befriend(p Peer) error {
 	return nil
 }
 
-// Forget drops a known device: we stop answering it (removed from the family).
+// Forget drops a known device: we stop answering it (removed from the family). Our
+// conversation's dictionaries and history go too.
 func (n *Node) Forget(addr string) {
 	n.mu.Lock()
+	n.dicts.forget(addr)
+	if ps := n.peers[addr]; ps != nil && ps.hist != nil {
+		ps.hist.gone = true
+	}
+	_ = os.Remove(historyPath(n.dir, addr))
 	delete(n.peers, addr)
 	if s := n.current[addr]; s != nil {
 		delete(n.current, addr)
@@ -436,9 +451,12 @@ func (n *Node) CallOn(ctx context.Context, peer string, stream uint64, tool, met
 	id := ps.callID
 	ch := make(chan callResult, 1)
 	ps.calls[id] = ch
+	if tool == 0 {
+		ps.sysCalls[id] = true
+	}
 	msg, err := cbor.Marshal(append([]any{0, id, tool, method}, args...))
 	if err == nil {
-		n.pushLocked(ps, msg, stream)
+		n.pushLocked(ps, msg, stream, tool != 0)
 	}
 	n.mu.Unlock()
 	if err != nil {
@@ -447,6 +465,7 @@ func (n *Node) CallOn(ctx context.Context, peer string, stream uint64, tool, met
 	defer func() {
 		n.mu.Lock()
 		delete(ps.calls, id)
+		delete(ps.sysCalls, id)
 		n.mu.Unlock()
 	}()
 	select {
@@ -474,7 +493,7 @@ func (n *Node) EventOn(peer string, stream uint64, tool, event int, args ...any)
 	if ps == nil {
 		return errors.New("unknown device")
 	}
-	n.pushLocked(ps, msg, stream)
+	n.pushLocked(ps, msg, stream, tool != 0)
 	return nil
 }
 
@@ -500,20 +519,21 @@ func (n *Node) Paths(peer string) []string {
 }
 
 // info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints].
-func (n *Node) info() []any {
+// The dictionaries are those peer may see.
+func (n *Node) info(peer string) []any {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.infoLocked()
+	return n.infoLocked(peer)
 }
 
-func (n *Node) infoLocked() []any {
+func (n *Node) infoLocked(peer string) []any {
 	tools := map[int]int{}
 	for k := range n.handlers {
 		if k[0] != 0 {
 			tools[k[0]] = 1
 		}
 	}
-	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(), toWire(n.hintsLocked())}
+	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked())}
 }
 
 // SetAdvertise announces these addresses instead of our own in invites and hellos: behind
@@ -813,8 +833,8 @@ func (n *Node) bootLocked(ps *peerState, boot uint32) {
 
 // sendInfoLocked sends our hello: name and where to find us (event 0.2).
 func (n *Node) sendInfoLocked(peer string) {
-	msg, _ := cbor.Marshal(append([]any{3, 0, 2}, n.infoLocked()...))
-	n.pushLocked(n.peerLocked(peer), msg, 0)
+	msg, _ := cbor.Marshal(append([]any{3, 0, 2}, n.infoLocked(peer)...))
+	n.pushLocked(n.peerLocked(peer), msg, 0, false)
 }
 
 // messageLocked handles a reassembled message (spec §6).
@@ -838,6 +858,9 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 		if cbor.Unmarshal(a[1], &id) != nil || cbor.Unmarshal(a[2], &tool) != nil || cbor.Unmarshal(a[3], &method) != nil {
 			return
 		}
+		if tool != 0 {
+			n.hearLocked(ps, msg)
+		}
 		h := n.handlers[[2]int{tool, method}]
 		args := a[4:]
 		go func() {
@@ -856,7 +879,7 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			b, _ := cbor.Marshal(out)
 			n.mu.Lock()
 			if ps := n.peerLocked(peer); ps != nil {
-				n.pushLocked(ps, b, stream) // the result goes back on the call's stream
+				n.pushLocked(ps, b, stream, tool != 0) // the result goes back on the call's stream
 			}
 			n.mu.Unlock()
 		}()
@@ -868,6 +891,9 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 		ch := ps.calls[id]
 		if ch == nil {
 			return
+		}
+		if !ps.sysCalls[id] {
+			n.hearLocked(ps, msg)
 		}
 		if kind == 1 {
 			ch <- callResult{res: a[2:]}
@@ -897,16 +923,21 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			if n.OnHello != nil {
 				go n.OnHello(peer)
 			}
-			ps.dicts, ps.lacks = nil, nil
+			ps.dicts, ps.lacks, ps.tried = nil, nil, nil
 			_ = cbor.Unmarshal(a[7], &ps.dicts)
+			n.fetchNewLocked(peer, ps)
 			n.drainLocked(peer, ps)
 			return
 		}
 		if tool == 0 && ev == 5 && len(a) >= 4 { // the dictionary list changed
-			ps.dicts, ps.lacks = nil, nil
+			ps.dicts, ps.lacks, ps.tried = nil, nil, nil
 			_ = cbor.Unmarshal(a[3], &ps.dicts)
+			n.fetchNewLocked(peer, ps)
 			n.drainLocked(peer, ps)
 			return
+		}
+		if tool != 0 {
+			n.hearLocked(ps, msg)
 		}
 		if n.OnEvent != nil {
 			args := a[3:]
@@ -923,7 +954,8 @@ func (n *Node) peerLocked(peer string) *peerState {
 		if n.Trust.Get(peer) == nil {
 			return nil
 		}
-		ps = &peerState{st: newStream(), eps: map[string]*epState{}, calls: map[uint64]chan callResult{}}
+		ps = &peerState{addr: peer, st: newStream(), eps: map[string]*epState{}, calls: map[uint64]chan callResult{},
+			sysCalls: map[uint64]bool{}}
 		n.peers[peer] = ps
 	}
 	return ps
@@ -1222,17 +1254,22 @@ func (n *Node) wakeLocked() {
 
 // --- compression (spec §5) ---
 
-// pushLocked queues a message, compressed with the newest common dictionary when worth it.
-// The slot refers to our list at send time: the list changes only through event 0.5, which
-// travels in the same order as messages.
-func (n *Node) pushLocked(ps *peerState, msg []byte, stream uint64) {
+// pushLocked queues a message, compressed when worth it: with our dictionary for this device,
+// else the newest one it also has. The slot refers to our list at send time: the list changes
+// only through event 0.5, which travels in the same order as messages.
+// talk: the message is conversation (not tool 0), so it goes to the history (learn.go).
+func (n *Node) pushLocked(ps *peerState, msg []byte, stream uint64, talk bool) {
 	defer n.wakeLocked()
-	d, slot := n.dicts.pick(ps.dicts, ps.lacks)
 	if n.NoCompression {
 		ps.st.push(msg, false, stream)
 		return
 	}
-	if z := compress(msg, d, slot); z != nil {
+	d, slot := n.dicts.pick(ps.addr, ps.dicts, ps.lacks)
+	z := compress(msg, d, slot)
+	if talk {
+		n.learnLocked(ps, msg, d, z)
+	}
+	if z != nil {
 		ps.st.push(z, true, stream)
 		return
 	}
@@ -1267,8 +1304,12 @@ func (n *Node) drainLocked(peer string, ps *peerState) {
 		plain, err := n.unzipLocked(ps, w.msg, w.zip)
 		switch {
 		case errors.Is(err, errNoDict):
-			n.fetchDictLocked(peer, ps, ps.dicts[int(w.msg[0])-1])
-			return
+			if id := ps.dicts[int(w.msg[0])-1]; len(id) > 0 {
+				n.fetchDictLocked(peer, ps, id, true)
+				return
+			} // a free slot: the message is damaged
+			ps.waiting = ps.waiting[1:]
+			continue
 		case errors.Is(err, errNoList):
 			return // wait for a hello or 0.5
 		}
@@ -1296,7 +1337,7 @@ func (n *Node) unzipLocked(ps *peerState, msg []byte, zip bool) ([]byte, error) 
 		if slot > len(ps.dicts) {
 			return nil, errNoList
 		}
-		if d = n.dicts.get(ps.dicts[slot-1]); d == nil {
+		if d = n.dicts.get(ps.dicts[slot-1], ps.addr); d == nil {
 			return nil, errNoDict
 		}
 	}
@@ -1312,8 +1353,21 @@ func outOfOrder(msg []byte) bool {
 	return msg[1] == 1 || msg[1] == 2 || (len(msg) > 3 && msg[1] == 3 && msg[2] == 0 && (msg[3] == 2 || msg[3] == 5))
 }
 
-// fetchDictLocked asks the sender for dictionary id (it compressed with it, so it has it).
-func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte) {
+// fetchNewLocked asks the device for the newest dictionary in its list that we lack: so it
+// can compress with it (only a dictionary both have is used). One at a time; one we could not
+// get (the family's, say) is not asked for again.
+func (n *Node) fetchNewLocked(peer string, ps *peerState) {
+	for _, id := range ps.dicts {
+		if len(id) > 0 && n.dicts.get(id, peer) == nil && !has(ps.tried, id) {
+			n.fetchDictLocked(peer, ps, id, false)
+			return
+		}
+	}
+}
+
+// fetchDictLocked asks the device for dictionary id: one it compressed a waiting message
+// with (it has it), or a new one in its list. What we get belongs to the pair with it.
+func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte, waiting bool) {
 	if ps.fetching {
 		return
 	}
@@ -1334,11 +1388,20 @@ func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte) {
 		defer n.mu.Unlock()
 		ps.fetching = false
 		if d != nil {
-			_ = n.addDictLocked(d)
-		} else if len(ps.waiting) > 0 {
+			d.peer = peer
+			if n.addDictLocked(d) != nil { // could not store it: do not ask again and again
+				d = nil
+			}
+		}
+		switch {
+		case d != nil:
+		case waiting && len(ps.waiting) > 0:
 			ps.waiting = ps.waiting[1:] // the dictionary is unreachable: this message is lost
+		default:
+			ps.tried = append(ps.tried, id)
 		}
 		n.drainLocked(peer, ps)
+		n.fetchNewLocked(peer, ps)
 	}()
 }
 
@@ -1356,7 +1419,7 @@ func (n *Node) dictHandler(peer string, args []cbor.RawMessage) ([]any, error) {
 	if ps := n.peers[peer]; ps != nil {
 		ps.lacks = append(ps.lacks, id)
 	}
-	d := n.dicts.get(id)
+	d := n.dicts.get(id, peer)
 	n.mu.Unlock()
 	if d == nil {
 		return nil, &Error{Code: ErrNotFound, Text: "no such dictionary"}
@@ -1364,7 +1427,8 @@ func (n *Node) dictHandler(peer string, args []cbor.RawMessage) ([]any, error) {
 	return []any{d.Raw}, nil
 }
 
-// AddDict stores a new (newest) dictionary and announces it to all known devices (event 0.5).
+// AddDict stores a new (newest) common dictionary and announces it to all known devices
+// (event 0.5).
 func (n *Node) AddDict(raw []byte) error {
 	d, err := NewDict(raw)
 	if err != nil {
@@ -1375,13 +1439,20 @@ func (n *Node) AddDict(raw []byte) error {
 	return n.addDictLocked(d)
 }
 
+// addDictLocked stores a dictionary and announces the new list to the devices that see it:
+// all for a common one, the pair's device for its own. Only over a live session: a new one
+// starts with our hello, which carries the list, and a queued announcement would open it
+// early, without the message the session is for.
 func (n *Node) addDictLocked(d *Dict) error {
 	if err := n.dicts.add(d); err != nil {
 		return err
 	}
-	msg, _ := cbor.Marshal([]any{3, 0, 5, n.dicts.ids()})
 	for _, p := range n.Trust.List() {
+		if !d.visible(p.Addr) || n.current[p.Addr] == nil {
+			continue
+		}
 		if ps := n.peerLocked(p.Addr); ps != nil {
+			msg, _ := cbor.Marshal([]any{3, 0, 5, n.dicts.ids(p.Addr)})
 			ps.st.push(msg, false, 0)
 		}
 	}
@@ -1389,9 +1460,9 @@ func (n *Node) addDictLocked(d *Dict) error {
 	return nil
 }
 
-// Dicts lists our dictionary ids, newest first.
-func (n *Node) Dicts() [][]byte {
+// Dicts lists the dictionary ids peer sees, newest first.
+func (n *Node) Dicts(peer string) [][]byte {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.dicts.ids()
+	return n.dicts.ids(peer)
 }

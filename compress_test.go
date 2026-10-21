@@ -70,16 +70,16 @@ func TestDictPick(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if d, slot := s.pick([][]byte{old.ID, fresh.ID}, nil); d != fresh || slot != 1 {
-		t.Fatalf("newest common is fresh in slot 1, got slot %d", slot)
+	if d, slot := s.pick("x", [][]byte{old.ID, fresh.ID}, nil); d != fresh || slot != 2 {
+		t.Fatalf("newest common is fresh in slot 2 (slots go by age), got slot %d", slot)
 	}
-	if d, slot := s.pick([][]byte{old.ID}, nil); d != old || slot != 2 {
-		t.Fatalf("the other has only old, slot 2, got %d", slot)
+	if d, slot := s.pick("x", [][]byte{old.ID}, nil); d != old || slot != 1 {
+		t.Fatalf("the other has only old, slot 1, got %d", slot)
 	}
-	if d, slot := s.pick(nil, nil); d != nil || slot != 0 {
+	if d, slot := s.pick("x", nil, nil); d != nil || slot != 0 {
 		t.Fatal("nothing in common: no dictionary")
 	}
-	if d, _ := s.pick([][]byte{old.ID, fresh.ID}, [][]byte{fresh.ID}); d != old {
+	if d, _ := s.pick("x", [][]byte{old.ID, fresh.ID}, [][]byte{fresh.ID}); d != old {
 		t.Fatal("do not use a dictionary the other side lost")
 	}
 	again := loadDicts(s.dir[:len(s.dir)-len("/net-dicts")])
@@ -142,7 +142,7 @@ func TestMissingDictFetched(t *testing.T) {
 	for range 3 {
 		echo(t, a, b, longText, 10*time.Second)
 	}
-	if len(b.Dicts()) != 1 || !bytes.Equal(b.Dicts()[0], DictID(raw)) {
+	if got := b.Dicts(a.ID.Addr()); len(got) != 1 || !bytes.Equal(got[0], DictID(raw)) {
 		t.Fatal("b should have got the dictionary from a")
 	}
 }
