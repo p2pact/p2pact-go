@@ -45,6 +45,10 @@ type history struct {
 	at          time.Time // when it was trained
 	plain, zips int       // compression with the current dictionary over the current window
 	base        float64   // and over the first window after training
+	worse       bool      // a window came out 15 % worse than the first
+	checked     time.Time // the last monthly and 15 % check
+	due         string    // a new dictionary is due ("" — not), waiting for a lull since dueAt
+	dueAt       time.Time
 	training    bool
 }
 
@@ -153,62 +157,144 @@ func (n *Node) flushHistory(h *history) {
 	}
 }
 
-// hearLocked records a conversation message we got from the device.
-func (n *Node) hearLocked(ps *peerState, msg []byte) {
-	if n.NoLearning || n.NoCompression || len(msg) < zipMin {
-		return
-	}
-	h := n.historyLocked(ps)
-	m := bytes.Clone(msg[:min(len(msg), learnSample)])
-	h.add(m, true)
-	n.saveLocked(h, m, true)
+// Learning is deferred: sending and receiving only queue the message (queueLocked). Once a
+// second the queue goes into the history in one go, off the sending path, and training waits
+// for a lull in the conversation: the first dictionaries by the history's size, the monthly
+// and the 15 % checks once a day.
+var (
+	learnTick  = time.Second
+	learnLull  = time.Second    // no messages with the device for this long: time to train
+	learnWait  = time.Minute    // or train anyway after waiting this long for a lull
+	learnCheck = 24 * time.Hour // how often the monthly and the 15 % checks run
+)
+
+// learnQueueMax: bytes waiting for the history; past it messages are skipped — a dictionary
+// needs what the conversation is like, not every message of it.
+const learnQueueMax = 1 << 20
+
+type pending struct {
+	msg         []byte // not copied: a message is not changed once sent or received
+	heard       bool
+	plain, zips int // compressed with our dictionary for the device: its size before and after
 }
 
-// learnLocked records a conversation message we send and trains a new dictionary when it is
-// time. d and z are the dictionary it was compressed with and the result (nil — sent as is).
-func (n *Node) learnLocked(ps *peerState, msg []byte, d *Dict, z []byte) {
-	if n.NoLearning || len(msg) < zipMin {
-		return
+// hearLocked queues a conversation message we got from the device.
+func (n *Node) hearLocked(ps *peerState, msg []byte) {
+	if !n.NoCompression {
+		n.queueLocked(ps, pending{msg: msg, heard: true})
 	}
-	h := n.historyLocked(ps)
-	m := bytes.Clone(msg[:min(len(msg), learnSample)])
-	h.add(m, false)
-	n.saveLocked(h, m, false)
-	own := n.dicts.own(ps.addr)
-	if own != nil && d == own {
-		h.plain += len(msg)
-		h.zips += len(msg)
+}
+
+// learnLocked queues a conversation message we send; d and z are the dictionary it was
+// compressed with and the result (nil — sent as is).
+func (n *Node) learnLocked(ps *peerState, msg []byte, d *Dict, z []byte) {
+	p := pending{msg: msg}
+	if d != nil && d.own {
+		p.plain, p.zips = len(msg), len(msg)
 		if z != nil {
-			h.zips += len(z) - len(msg)
+			p.zips = len(z)
 		}
 	}
+	n.queueLocked(ps, p)
+}
+
+func (n *Node) queueLocked(ps *peerState, p pending) {
+	if n.NoLearning || len(p.msg) < zipMin || ps.queued >= learnQueueMax {
+		return
+	}
+	ps.queue = append(ps.queue, p)
+	ps.queued += min(len(p.msg), learnSample)
+	ps.lastTalk = time.Now()
+}
+
+// learnLoop takes the queues into the histories and trains when it is time.
+func (n *Node) learnLoop() {
+	defer n.wg.Done()
+	t := time.NewTicker(learnTick)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.stop:
+			return
+		case now := <-t.C:
+			n.learnTick(now)
+		}
+	}
+}
+
+func (n *Node) learnTick(now time.Time) {
+	type batch struct {
+		ps *peerState
+		q  []pending
+	}
+	var work []batch
+	n.mu.Lock()
+	for _, ps := range n.peers {
+		if len(ps.queue) > 0 || (ps.hist != nil && ps.hist.due != "") {
+			work = append(work, batch{ps, ps.queue})
+			ps.queue, ps.queued = nil, 0
+		}
+	}
+	n.mu.Unlock()
+	for _, w := range work {
+		cut := make([][]byte, len(w.q)) // copied outside the lock
+		for i, p := range w.q {
+			cut[i] = bytes.Clone(p.msg[:min(len(p.msg), learnSample)])
+		}
+		n.mu.Lock()
+		if n.peers[w.ps.addr] == w.ps { // not forgotten meanwhile
+			h := n.historyLocked(w.ps)
+			for i, p := range w.q {
+				h.add(cut[i], p.heard)
+				n.saveLocked(h, cut[i], p.heard)
+				h.plain += p.plain
+				h.zips += p.zips
+			}
+			n.considerLocked(w.ps, h, now)
+		}
+		n.mu.Unlock()
+	}
+}
+
+// considerLocked decides whether a new dictionary is due and trains it in a lull.
+func (n *Node) considerLocked(ps *peerState, h *history, now time.Time) {
 	if h.training {
 		return
 	}
+	own := n.dicts.own(ps.addr)
 	size := h.size()
-	switch {
-	case own == nil:
-		if size < max(learnFirst, 2*h.trained) { // trained: a try that failed
-			return
-		}
-	case size < learnFirst: // too little to replace what we have (the history was lost, say)
-		return
-	case h.trained < learnMax && size >= 2*h.trained: // the history doubled
-	case time.Since(h.at) > learnMonth:
-	case h.plain >= learnWindow:
+	if h.plain >= learnWindow { // compression over the last window of what we sent with it
 		ratio := float64(h.zips) / float64(h.plain)
 		h.plain, h.zips = 0, 0
 		if h.base == 0 {
 			h.base = ratio
-			return
+		} else if ratio >= h.base*learnWorse {
+			h.worse = true
 		}
-		if ratio < h.base*learnWorse {
-			return
+	}
+	if h.due == "" {
+		switch {
+		case own == nil:
+			if size >= max(learnFirst, 2*h.trained) { // trained: a try that failed
+				h.due = "first"
+			}
+		case size < learnFirst: // too little to replace what we have (the history was lost, say)
+		case h.trained < learnMax && size >= 2*h.trained:
+			h.due = "doubled"
+		case now.Sub(h.checked) >= learnCheck:
+			h.checked = now
+			if now.Sub(h.at) > learnMonth || h.worse {
+				h.due = "check"
+			}
 		}
-	default:
+		if h.due != "" {
+			h.dueAt = now
+		}
+	}
+	if h.due == "" || (now.Sub(ps.lastTalk) < learnLull && now.Sub(h.dueAt) < learnWait) {
 		return
 	}
-	h.training = true
+	h.due, h.worse, h.training = "", false, true
 	ownMsgs := append([][]byte(nil), h.own...)
 	heard := append([][]byte(nil), h.heard[len(h.heard)-countFrom(h.heard, max(0, learnHeard-h.ownSize)):]...)
 	go func() {
@@ -233,7 +319,7 @@ func (n *Node) learnLocked(ps *peerState, msg []byte, d *Dict, z []byte) {
 		}
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		// a failure waits like a success: until the history doubles or a month passes
+		// a failure waits like a success: until the history doubles or the next check
 		h.training, h.trained, h.at = false, size, time.Now()
 		select {
 		case <-n.stop:
@@ -262,7 +348,7 @@ func countFrom(msgs [][]byte, n int) int {
 
 // DictState tells what compresses messages to peer: own — our newest dictionary trained for it
 // (nil — none yet), using — the one used now (nil — none, plain zstd), training — a new one is
-// being trained.
+// due or being trained, or messages wait to be learnt.
 func (n *Node) DictState(peer string) (own, using []byte, training bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -273,7 +359,7 @@ func (n *Node) DictState(peer string) (own, using []byte, training bool) {
 		if d, _ := n.dicts.pick(peer, ps.dicts, ps.lacks); d != nil {
 			using = d.ID
 		}
-		training = ps.hist != nil && ps.hist.training
+		training = len(ps.queue) > 0 || ps.hist != nil && (ps.hist.training || ps.hist.due != "")
 	}
 	return own, using, training
 }

@@ -95,6 +95,9 @@ type peerState struct {
 	tried    [][]byte        // dictionaries of its list we asked it for and did not get
 	hist     *history        // what we sent it and got from it, to train our dictionary for it
 	sysCalls map[uint64]bool // our calls of tool 0: their results are not conversation
+	queue    []pending       // conversation messages waiting to be learnt (learn.go)
+	queued   int
+	lastTalk time.Time
 }
 
 type inbound struct {
@@ -246,6 +249,8 @@ func (n *Node) SetRelay(h RelayHint) {
 // Start runs the service loop: delivery, retransmission, keepalives, connecting to known
 // devices.
 func (n *Node) Start() {
+	n.wg.Add(1)
+	go n.learnLoop()
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()

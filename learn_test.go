@@ -199,3 +199,29 @@ func TestForgetDropsDicts(t *testing.T) {
 		t.Fatal("the history with b is still there")
 	}
 }
+
+// Training waits for a lull: while the conversation goes on, no dictionary is trained; once it
+// pauses, one is.
+func TestTrainInLull(t *testing.T) {
+	lull, wait := learnLull, learnWait
+	learnLull, learnWait = 1500*time.Millisecond, time.Hour
+	defer func() { learnLull, learnWait = lull, wait }()
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	until := time.Now().Add(4 * time.Second)
+	for i := 0; time.Now().Before(until); i++ { // 32 KB in the first second, then on and on
+		echo(t, a, b, chatLine(i), 5*time.Second)
+		if i > 250 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	a.mu.Lock()
+	own := a.dicts.own(b.ID.Addr())
+	a.mu.Unlock()
+	if own != nil {
+		t.Fatal("a trained in the middle of the conversation")
+	}
+	waitFor(t, a, "a did not train in the lull", func() bool { return a.dicts.own(b.ID.Addr()) != nil })
+}

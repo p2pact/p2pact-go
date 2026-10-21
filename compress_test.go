@@ -138,6 +138,7 @@ func TestMissingDictFetched(t *testing.T) {
 	waitDicts(t, b, a, 1)
 	b.mu.Lock()
 	b.dicts.dicts = nil // b lost the dictionary and a does not know
+	b.dicts.gen++
 	b.mu.Unlock()
 	for range 3 {
 		echo(t, a, b, longText, 10*time.Second)

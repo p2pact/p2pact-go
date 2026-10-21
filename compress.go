@@ -40,12 +40,17 @@ type Dict struct {
 	peer string
 	own  bool
 
-	once sync.Once
-	enc  *zstd.Encoder
-	fast *zstd.Encoder
-	dec  *zstd.Decoder
-	err  error
+	once  sync.Once
+	quick *zstd.Encoder // short messages: with a dictionary the fastest level loses ~3 % of bytes
+	enc   *zstd.Encoder
+	fast  *zstd.Encoder
+	dec   *zstd.Decoder
+	err   error
 }
+
+// zipQuickBelow: shorter messages are compressed at the fastest level when there is a
+// dictionary (most chat messages: 6 µs instead of 21).
+const zipQuickBelow = 1 << 10
 
 // DictID is a dictionary's id from its bytes.
 func DictID(raw []byte) []byte {
@@ -71,6 +76,10 @@ func (d *Dict) init() error {
 		if d.err == nil {
 			d.fast, d.err = zstd.NewWriter(nil, zstd.WithEncoderDict(d.Raw), zstd.WithEncoderCRC(false),
 				zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
+		}
+		if d.err == nil {
+			d.quick, d.err = zstd.NewWriter(nil, zstd.WithEncoderDict(d.Raw), zstd.WithEncoderCRC(false),
+				zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
 		}
 		if d.err == nil {
 			d.dec, d.err = zstd.NewReader(nil, zstd.WithDecoderDicts(d.Raw), zstd.WithDecoderConcurrency(1),
@@ -115,6 +124,8 @@ func compress(msg []byte, d *Dict, slot int) []byte {
 		enc = d.enc
 		if len(msg) >= zipFastFrom {
 			enc = d.fast
+		} else if len(msg) < zipQuickBelow {
+			enc = d.quick
 		}
 	}
 	frame := stripFrame(enc.EncodeAll(msg, nil))
@@ -197,13 +208,20 @@ type dictStore struct {
 	// (a message compressed with it may still be on its way on another stream, behind the new
 	// list); a dropped one leaves an empty id, and a new one goes to the end.
 	slots map[string][][]byte
+	gen   int                // bumped on every change of the dictionaries
+	cache map[string]slotsAt // ids by device, as of gen
+}
+
+type slotsAt struct {
+	gen int
+	ids [][]byte
 }
 
 // slotsMax: past this many slots, a new dictionary takes the oldest empty one.
 const slotsMax = 32
 
 func loadDicts(dir string) *dictStore {
-	s := &dictStore{dir: filepath.Join(dir, "net-dicts"), slots: map[string][][]byte{}}
+	s := &dictStore{dir: filepath.Join(dir, "net-dicts"), slots: map[string][][]byte{}, cache: map[string]slotsAt{}}
 	b, _ := os.ReadFile(filepath.Join(s.dir, "order"))
 	for _, line := range strings.Split(string(b), "\n") {
 		f := strings.Fields(line)
@@ -267,6 +285,7 @@ func (s *dictStore) add(d *Dict) error {
 		}
 	}
 	s.dicts = out
+	s.gen++
 	return s.saveOrder()
 }
 
@@ -313,7 +332,13 @@ func (s *dictStore) listed(list []*Dict, id []byte) bool {
 }
 
 // ids is our list for peer, by slot (an empty id — a free slot).
-func (s *dictStore) ids(peer string) [][]byte {
+func (s *dictStore) ids(peer string) [][]byte { return append([][]byte(nil), s.slotsFor(peer)...) }
+
+// slotsFor is ids without the copy, rebuilt only when the dictionaries changed.
+func (s *dictStore) slotsFor(peer string) [][]byte {
+	if c, ok := s.cache[peer]; ok && c.gen == s.gen {
+		return c.ids
+	}
 	list := s.list(peer)
 	slots := s.slots[peer]
 	for i, id := range slots {
@@ -342,12 +367,13 @@ func (s *dictStore) ids(peer string) [][]byte {
 		}
 	}
 	s.slots[peer] = slots
-	return append([][]byte(nil), slots...)
+	s.cache[peer] = slotsAt{s.gen, slots}
+	return slots
 }
 
 // slotOf is d's slot in our list for peer (from 1).
 func (s *dictStore) slotOf(peer string, d *Dict) int {
-	for i, id := range s.ids(peer) {
+	for i, id := range s.slotsFor(peer) {
 		if bytes.Equal(id, d.ID) {
 			return i + 1
 		}
@@ -404,6 +430,8 @@ func (s *dictStore) forget(peer string) {
 		}
 	}
 	delete(s.slots, peer)
+	delete(s.cache, peer)
+	s.gen++
 	_ = s.saveOrder()
 }
 
