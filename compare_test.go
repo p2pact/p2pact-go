@@ -187,7 +187,8 @@ func TestCompareFirstAnswer(t *testing.T) {
 	a.mu.Lock()
 	delete(a.current, b.ID.Addr()) // and the first forgets the old session: an honest cold start
 	a.mu.Unlock()
-	a.UDP().Delay, b2.UDP().Delay = oneWay, oneWay
+	a.UDP().SetDelay(oneWay)
+	b2.UDP().SetDelay(oneWay)
 	start = time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

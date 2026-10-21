@@ -12,7 +12,7 @@ import (
 	"math/big"
 	mrand "math/rand"
 	"net"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,11 +120,13 @@ func TestPairAndCallUDP(t *testing.T) {
 		t.Fatalf("error: %v", err)
 	}
 	got := make(chan string, 1)
+	b.mu.Lock() // the node is running: hooks are read under its lock
 	b.OnEvent = func(peer string, tool, ev int, args []cbor.RawMessage) {
 		var s string
 		_ = cbor.Unmarshal(args[0], &s)
 		got <- s
 	}
+	b.mu.Unlock()
 	_ = a.Event(b.ID.Addr(), 64, 1, "event")
 	select {
 	case s := <-got:
@@ -157,9 +159,10 @@ func TestLossyLongMessage(t *testing.T) {
 	defer b.Close()
 	pair(t, a, b)
 	r := mrand.New(mrand.NewSource(1))
-	var mu atomic.Int32
-	drop := func() bool { mu.Add(1); return r.Intn(3) == 0 }
-	a.UDP().Drop, b.UDP().Drop = drop, drop
+	var mu sync.Mutex // both roads draw from one source, from their own goroutines
+	drop := func() bool { mu.Lock(); defer mu.Unlock(); return r.Intn(3) == 0 }
+	a.UDP().SetDrop(drop)
+	b.UDP().SetDrop(drop)
 	data := make([]byte, 200<<10)
 	_, _ = rand.Read(data)
 	echo(t, a, b, data, 2*time.Minute) // a third lost both ways: slow, and it varies a lot
@@ -180,7 +183,8 @@ func TestFallbackToRelay(t *testing.T) {
 		}
 	}
 	off := func() bool { return true }
-	a.UDP().Drop, b.UDP().Drop = off, off
+	a.UDP().SetDrop(off)
+	b.UDP().SetDrop(off)
 	echo(t, a, b, []byte("through the relay"), 20*time.Second)
 }
 

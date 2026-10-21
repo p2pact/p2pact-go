@@ -37,7 +37,8 @@ func TestFallbackToTCP(t *testing.T) {
 	echo(t, a, b, []byte("over udp"), 5*time.Second)
 	before := a.handshakes.Load() + b.handshakes.Load()
 	off := func() bool { return true }
-	a.UDP().Drop, b.UDP().Drop = off, off
+	a.UDP().SetDrop(off)
+	b.UDP().SetDrop(off)
 	echo(t, a, b, []byte("over tcp"), 10*time.Second)
 	if after := a.handshakes.Load() + b.handshakes.Load(); after != before {
 		t.Errorf("switching to tcp needed %d new handshakes", after-before)

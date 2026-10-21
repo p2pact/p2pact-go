@@ -38,15 +38,12 @@ type UDPRoad struct {
 	conn *net.UDPConn
 	mu   sync.Mutex
 	addr map[string]*net.UDPAddr
-	// Drop is for tests: the packet is lost (network loss).
-	Drop func() bool
-	// Delay is for tests: one-way packet delay (a distant network).
-	Delay time.Duration
-	// Rate is for tests: link speed in bytes per second (0 — unlimited); packets queue
-	// behind each other like on a slow link.
-	Rate int
 
-	free                   time.Time // when the emulated link is free again
+	// test hooks (SetDrop, SetDelay, SetRate): tests change them on a running road
+	drop        atomic.Pointer[func() bool]
+	delay, rate atomic.Int64
+	free        time.Time // when the emulated link is free again
+
 	sentBytes, sentPackets atomic.Int64
 	recvBytes, recvPackets atomic.Int64
 }
@@ -60,6 +57,28 @@ type RoadStats struct {
 // Stats returns the counters since the road was opened.
 func (u *UDPRoad) Stats() RoadStats {
 	return RoadStats{u.sentBytes.Load(), u.sentPackets.Load(), u.recvBytes.Load(), u.recvPackets.Load()}
+}
+
+// SetDrop is for tests: f says the packet is lost (network loss), both ways; nil — none is.
+// f is called from several goroutines.
+func (u *UDPRoad) SetDrop(f func() bool) {
+	if f == nil {
+		u.drop.Store(nil)
+	} else {
+		u.drop.Store(&f)
+	}
+}
+
+// SetDelay is for tests: one-way packet delay (a distant network).
+func (u *UDPRoad) SetDelay(d time.Duration) { u.delay.Store(int64(d)) }
+
+// SetRate is for tests: link speed in bytes per second (0 — unlimited); packets queue behind
+// each other like on a slow link.
+func (u *UDPRoad) SetRate(bytesPerSec int) { u.rate.Store(int64(bytesPerSec)) }
+
+func (u *UDPRoad) dropped() bool {
+	f := u.drop.Load()
+	return f != nil && (*f)()
 }
 
 func listenUDP(addr string) (*UDPRoad, error) {
@@ -85,7 +104,7 @@ func (u *UDPRoad) LocalAddr() string { return u.conn.LocalAddr().String() }
 func (u *UDPRoad) Send(addr string, pkt []byte) error {
 	u.sentBytes.Add(int64(len(pkt)))
 	u.sentPackets.Add(1)
-	if u.Drop != nil && u.Drop() {
+	if u.dropped() {
 		return nil
 	}
 	u.mu.Lock()
@@ -100,15 +119,15 @@ func (u *UDPRoad) Send(addr string, pkt []byte) error {
 		u.addr[addr] = a
 		u.mu.Unlock()
 	}
-	if u.Delay > 0 || u.Rate > 0 {
-		wait := u.Delay
-		if u.Rate > 0 {
+	if delay, rate := time.Duration(u.delay.Load()), u.rate.Load(); delay > 0 || rate > 0 {
+		wait := delay
+		if rate > 0 {
 			u.mu.Lock()
 			now := time.Now()
 			if u.free.Before(now) {
 				u.free = now
 			}
-			u.free = u.free.Add(time.Duration(len(pkt)+28) * time.Second / time.Duration(u.Rate))
+			u.free = u.free.Add(time.Duration(len(pkt)+28) * time.Second / time.Duration(rate))
 			wait += u.free.Sub(now)
 			u.mu.Unlock()
 		}
@@ -132,7 +151,7 @@ func (u *UDPRoad) run(recv func([]byte, Endpoint)) {
 		}
 		u.recvBytes.Add(int64(n))
 		u.recvPackets.Add(1)
-		if u.Drop != nil && u.Drop() {
+		if u.dropped() {
 			continue
 		}
 		recv(append([]byte(nil), buf[:n]...), Endpoint{Road: u, Addr: from.String()})
