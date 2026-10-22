@@ -265,3 +265,66 @@ func TestWindow(t *testing.T) {
 		}
 	}
 }
+
+// Events and calls of one stream run in the order sent, one at a time; a slow handler holds
+// up its own stream only.
+func TestStreamOrderOfEvents(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	release := make(chan struct{})
+	b.Handle(64, 2, func(_ string, _ []cbor.RawMessage) ([]any, error) { // slow, on stream 2
+		<-release
+		return nil, nil
+	})
+	var mu sync.Mutex
+	var got []int
+	done := make(chan struct{})
+	const total = 300
+	b.mu.Lock()
+	b.OnEvent = func(_ string, _, ev int, _ []cbor.RawMessage) {
+		time.Sleep(time.Duration(mrand.Intn(200)) * time.Microsecond) // a goroutine per event would reorder
+		mu.Lock()
+		got = append(got, ev)
+		if len(got) == total {
+			close(done)
+		}
+		mu.Unlock()
+	}
+	b.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = a.CallOn(ctx, b.ID.Addr(), 2, 64, 2)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	_ = a.EventOn(b.ID.Addr(), 2, 64, 0) // behind the slow call
+	for i := 1; i < total; i++ {
+		_ = a.EventOn(b.ID.Addr(), 1, 64, i)
+	}
+	select {
+	case <-done:
+		t.Fatal("an event overtook the slow call on its stream")
+	case <-time.After(3 * time.Second):
+	}
+	mu.Lock()
+	if len(got) != total-1 {
+		t.Fatalf("the slow call held up another stream: %d of %d events", len(got), total-1)
+	}
+	mu.Unlock()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the events did not arrive")
+	}
+	if got[total-1] != 0 {
+		t.Fatalf("the event on the slow stream ran before the call finished: %v", got[len(got)-1])
+	}
+	for i := 1; i < total; i++ {
+		if got[i-1] != i {
+			t.Fatalf("out of order at %d: %v", i, got[:i])
+		}
+	}
+}

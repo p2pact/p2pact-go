@@ -98,6 +98,7 @@ type peerState struct {
 	queue    []pending       // conversation messages waiting to be learnt (learn.go)
 	queued   int
 	lastTalk time.Time
+	inbox    map[uint64]*inbox // calls and events waiting for their turn, per stream
 }
 
 type inbound struct {
@@ -117,7 +118,8 @@ type Node struct {
 	Trust *Trust
 	Name  string
 	dir   string
-	// OnEvent receives tool events (except tool 0) from known devices.
+	// OnEvent receives tool events (except tool 0) from known devices: in the order sent on
+	// each stream, one at a time, together with that stream's calls (spec §6).
 	OnEvent func(peer string, tool, event int, args []cbor.RawMessage)
 	// OnPaired is called after pairing (on either side).
 	OnPaired func(p Peer)
@@ -294,7 +296,8 @@ func (n *Node) Close() {
 	n.wg.Wait()
 }
 
-// Handle registers method tool.method.
+// Handle registers method tool.method. Calls of one device on one stream run one at a time,
+// in the order sent, together with its events there (spec §6); other streams do not wait.
 func (n *Node) Handle(tool, method int, h Handler) {
 	n.mu.Lock()
 	n.handlers[[2]int{tool, method}] = h
@@ -869,7 +872,7 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 		h := n.handlers[[2]int{tool, method}]
 		args := a[4:]
 		boot := ps.boot
-		go func() {
+		run := func() {
 			var out []any
 			if h == nil {
 				out = []any{2, id, ErrNoMethod, "no such method"}
@@ -889,7 +892,12 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 				n.pushLocked(ps, b, stream, tool != 0, true)
 			}
 			n.mu.Unlock()
-		}()
+		}
+		if tool == 0 { // service calls (a dictionary, a ping) never wait behind a slow handler
+			go run()
+		} else {
+			n.inboxLocked(ps, stream, run)
+		}
 	case 1, 2: // result, error
 		var id uint64
 		if cbor.Unmarshal(a[1], &id) != nil {
@@ -946,11 +954,49 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 		if tool != 0 {
 			n.hearLocked(ps, msg)
 		}
-		if n.OnEvent != nil {
+		if on := n.OnEvent; on != nil {
 			args := a[3:]
-			go n.OnEvent(peer, tool, ev, args)
+			n.inboxLocked(ps, stream, func() { on(peer, tool, ev, args) })
 		}
 	}
+}
+
+// inbox runs a stream's calls and events one at a time, in the order they came (spec §6).
+type inbox struct {
+	q       []func()
+	running bool
+}
+
+// inboxLocked queues f behind the stream's earlier calls and events. Each stream has its own
+// worker while it has work: a slow handler holds up its stream only, never the node's lock.
+func (n *Node) inboxLocked(ps *peerState, stream uint64, f func()) {
+	if ps.inbox == nil {
+		ps.inbox = map[uint64]*inbox{}
+	}
+	ib := ps.inbox[stream]
+	if ib == nil {
+		ib = &inbox{}
+		ps.inbox[stream] = ib
+	}
+	ib.q = append(ib.q, f)
+	if ib.running {
+		return
+	}
+	ib.running = true
+	go func() {
+		for {
+			n.mu.Lock()
+			if len(ib.q) == 0 {
+				delete(ps.inbox, stream)
+				n.mu.Unlock()
+				return
+			}
+			f := ib.q[0]
+			ib.q = ib.q[1:]
+			n.mu.Unlock()
+			f()
+		}
+	}()
 }
 
 // --- sending ---
