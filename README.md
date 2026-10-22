@@ -50,6 +50,10 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
   turns that off, `DictState` tells what compresses messages to a device now.
 - `Befriend` — add a device known from the family book without pairing.
 - `SetRelay` — your relay for when devices cannot reach each other directly.
+- `SetPaused(true)` before the computer sleeps, `SetPaused(false)` when it wakes: while paused
+  the node sends nothing (relay and TCP connections closed, no keepalives), so it does not wake
+  the computer; messages wait in their queues, calls keep their timeouts. On resume it speaks
+  to its devices first and sessions come back at once.
 - `AttachRoad` — a road your app provides: Bluetooth LE GATT, a serial line, a pipe (spec §3).
   The app implements `Send` and hands what arrives to `Receive`:
 

@@ -17,13 +17,16 @@ import (
 )
 
 const (
-	tsSkew       = 2 * time.Minute  // an older handshake start is a replay: drop it
-	initEvery    = time.Second      // handshake retry while unanswered
-	autoConnect  = 30 * time.Second // how often to try known devices without a session
-	aliveFor     = 60 * time.Second // a road is alive if something arrived on it within this time
-	keepaliveGap = 25 * time.Second
-	sessionIdle  = 3 * time.Minute
+	tsSkew      = 2 * time.Minute  // an older handshake start is a replay: drop it
+	initEvery   = time.Second      // handshake retry while unanswered
+	autoConnect = 30 * time.Second // how often to try known devices without a session
+	aliveFor    = 60 * time.Second // a road is alive if something arrived on it within this time
+	sessionIdle = 3 * time.Minute
 )
+
+// keepaliveGap is how long a live road may stay quiet before a keepalive goes on it; tests
+// shorten it.
+var keepaliveGap = 25 * time.Second
 
 // probeEvery is how often the direct roads are tried while a session runs over a relay or an
 // application road (spec §7); tests shorten it.
@@ -163,6 +166,8 @@ type Node struct {
 	own  *RelayHint
 	rel  map[string]*RelayRoad  // by server address
 	apps map[*AttachedRoad]bool // roads the application provides (approad.go)
+	// paused: the device sleeps (SetPaused): nothing is sent, nothing is taken in
+	paused bool
 
 	sessions map[uint32]*session // by our index
 	current  map[string]*session // the best session with a device
@@ -232,7 +237,7 @@ func (n *Node) RebindUDP(addr string) error {
 				ps.eps[ne.ep.key()] = ne
 			}
 		}
-		if s := n.current[peer]; s != nil {
+		if s := n.current[peer]; s != nil && !n.paused {
 			n.sendLocked(now, peer, ps, s, keepalive(), true)
 		}
 	}
@@ -304,8 +309,8 @@ func (n *Node) Start() {
 }
 
 func (n *Node) Close() {
+	n.mu.Lock() // under the lock: SetPaused sees either a running node or a closed one
 	close(n.stop)
-	n.mu.Lock()
 	if n.udp != nil {
 		n.udp.close()
 	}
@@ -326,6 +331,63 @@ func (n *Node) Close() {
 	n.wg.Wait()
 }
 
+// SetPaused pauses the node (on) or resumes it: for a computer going to sleep, so that nothing
+// the node does on the network wakes it. While paused the node sends nothing at all and takes
+// in nothing: relay connections close, TCP connections close and new ones are refused (the
+// listener stays, so the port and the hints do not change), the UDP socket stays open but
+// silent, roads the application attached stay attached but get nothing to send. No
+// keepalives, no probes, no reconnects. What the application sends meanwhile is queued and
+// calls keep their timeouts. Other devices see a device that is unreachable.
+//
+// On resume the node speaks first: it rejoins its relay channels, sends a keepalive to every
+// device it has a session with (on all its roads) and starts a handshake with every other
+// known device, then sends what was queued. Calling it twice with the same value does
+// nothing; after Close it does nothing.
+func (n *Node) SetPaused(on bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	select {
+	case <-n.stop:
+		return
+	default:
+	}
+	if n.paused == on {
+		return
+	}
+	n.paused = on
+	if n.tcp != nil {
+		n.tcp.pause(on)
+	}
+	if on {
+		for _, r := range n.rel {
+			r.close()
+		}
+		for a := range n.apps {
+			a.drop()
+		}
+		return
+	}
+	now := time.Now()
+	if n.own != nil {
+		for id := range n.invites {
+			n.relayLocked(*n.own).join(id, "a")
+		}
+	}
+	for _, p := range n.Trust.List() {
+		n.joinPairLocked(&p)
+		if ps := n.peerLocked(p.Addr); ps != nil {
+			ps.lastInit = time.Time{} // the handshakes below go now, not after autoConnect
+		}
+	}
+	for peer, ps := range n.peers {
+		if s := n.current[peer]; s != nil {
+			n.sendLocked(now, peer, ps, s, keepalive(), true)
+		}
+	}
+	n.pumpLocked(now)
+	n.maintainLocked(now)
+}
+
 // Handle registers method tool.method. Calls of one device on one stream run one at a time,
 // in the order sent, together with its events there (spec §6); other streams do not wait. A
 // handler that waits long returns Later, so that the stream goes on without it.
@@ -343,7 +405,7 @@ func (n *Node) Invite(ttl time.Duration) *Invite {
 	defer n.mu.Unlock()
 	inv := &Invite{Key: n.ID.Key.Public, Name: n.Name, Secret: randBytes(32), Exp: time.Now().Add(ttl), Hints: n.hintsLocked()}
 	n.invites[hexs(inv.ID())] = inv
-	if n.own != nil {
+	if n.own != nil && !n.paused { // paused: joined on resume
 		n.relayLocked(*n.own).join(hexs(inv.ID()), "a")
 	}
 	return inv
@@ -364,11 +426,11 @@ func (n *Node) Join(ctx context.Context, inv *Invite) (Peer, error) {
 			eps = append(eps, Endpoint{Road: n.tcp, Addr: a})
 		}
 	}
+	var rel *RelayRoad
 	if inv.Hints.Relay != nil {
-		r := n.relayLocked(*inv.Hints.Relay)
-		r.join(hexs(inv.ID()), "b")
-		defer r.leave(hexs(inv.ID()))
-		eps = append(eps, Endpoint{Road: r, Addr: hexs(inv.ID())})
+		rel = n.relayLocked(*inv.Hints.Relay)
+		defer rel.leave(hexs(inv.ID()))
+		eps = append(eps, Endpoint{Road: rel, Addr: hexs(inv.ID())})
 	}
 	for a := range n.apps { // a link the application opened to a device it has not named
 		if a.peer == "" || a.peer == addr {
@@ -397,8 +459,13 @@ func (n *Node) Join(ctx context.Context, inv *Invite) (Peer, error) {
 		n.hs[local] = &handshake{pair: true, hs: hs, invite: inv, done: done, at: time.Now()}
 		pkt := append([]byte{pPair1}, inv.ID()...)
 		pkt = append(put32(pkt, local), msg1...)
-		for _, e := range eps {
-			_ = e.Road.Send(e.Addr, pkt)
+		if !n.paused { // paused: try again on the next tick
+			if rel != nil {
+				rel.join(hexs(inv.ID()), "b") // again after a pause closed it
+			}
+			for _, e := range eps {
+				_ = e.Road.Send(e.Addr, pkt)
+			}
 		}
 		n.mu.Unlock()
 		select {
@@ -619,6 +686,9 @@ func (n *Node) receive(pkt []byte, from Endpoint) {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.paused { // what came is dropped unanswered: its sender sends it again after we resume
+		return
+	}
 	now := time.Now()
 	switch pkt[0] {
 	case pData:
@@ -1206,6 +1276,9 @@ func (n *Node) relayLocked(h RelayHint) *RelayRoad {
 
 // sendLocked sends data packet content: on the best road, or on all when retransmitting.
 func (n *Node) sendLocked(now time.Time, peer string, ps *peerState, s *session, plain []byte, all bool) {
+	if n.paused {
+		return
+	}
 	hdr := put32(put32([]byte{pData}, s.remote), uint32(s.sendN))
 	pkt := s.send.Encrypt(append([]byte(nil), hdr...), s.sendN, hdr, plain)
 	s.sendN++
@@ -1219,7 +1292,7 @@ func (n *Node) sendLocked(now time.Time, peer string, ps *peerState, s *session,
 // startInitLocked starts a session with a known device (Noise_IK); first is first-packet data.
 func (n *Node) startInitLocked(now time.Time, peer string, ps *peerState, first []byte) {
 	p := n.Trust.Get(peer)
-	if p == nil || now.Sub(ps.lastInit) < ps.initGap() {
+	if p == nil || n.paused || now.Sub(ps.lastInit) < ps.initGap() {
 		return
 	}
 	ps.lastInit = now
@@ -1260,6 +1333,9 @@ func (n *Node) startInitLocked(now time.Time, peer string, ps *peerState, first 
 
 // pumpLocked sends what is queued and what is due for retransmission.
 func (n *Node) pumpLocked(now time.Time) {
+	if n.paused { // nothing goes, and no timer counts a try: delivery resumes where it stopped
+		return
+	}
 	for peer, ps := range n.peers {
 		s := n.current[peer]
 		if s == nil {
@@ -1345,18 +1421,15 @@ func (n *Node) stuckLocked(ps *peerState) bool {
 
 // maintainLocked runs every second: connect to known devices, keep channels, clean up.
 func (n *Node) maintainLocked(now time.Time) {
+	if n.paused {
+		return
+	}
 	for _, p := range n.Trust.List() {
 		ps := n.peerLocked(p.Addr)
 		if ps == nil {
 			continue
 		}
-		if r := n.pairRelayLocked(&p); r != nil {
-			role := "a"
-			if p.Addr < n.ID.Addr() {
-				role = "b"
-			}
-			r.join(p.relayChannel(), role)
-		}
+		n.joinPairLocked(&p)
 		s := n.current[p.Addr]
 		if s == nil && now.Sub(ps.lastInit) >= autoConnect {
 			n.startInitLocked(now, p.Addr, ps, nil)
@@ -1382,6 +1455,17 @@ func (n *Node) maintainLocked(now time.Time) {
 				n.relayLocked(*n.own).leave(id)
 			}
 		}
+	}
+}
+
+// joinPairLocked keeps the pair's relay channel open.
+func (n *Node) joinPairLocked(p *Peer) {
+	if r := n.pairRelayLocked(p); r != nil {
+		role := "a"
+		if p.Addr < n.ID.Addr() {
+			role = "b"
+		}
+		r.join(p.relayChannel(), role)
 	}
 }
 

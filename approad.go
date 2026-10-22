@@ -198,6 +198,18 @@ func (a *AttachedRoad) Receive(b []byte) {
 	}
 }
 
+// drop discards what waits for the application's Send (the node pauses): it would go out
+// while the device sleeps, and delivery sends it again after resume.
+func (a *AttachedRoad) drop() {
+	for {
+		select {
+		case <-a.out:
+		default:
+			return
+		}
+	}
+}
+
 // Detach stops using the road: the link is gone. The session goes on over the other roads.
 func (a *AttachedRoad) Detach() {
 	a.once.Do(func() {
@@ -227,6 +239,9 @@ func (a *AttachedRoad) rate() float64 {
 // appAttachedLocked starts using a road the application attached for a device: a keepalive
 // over it when there is a session (so the other side binds it too), a handshake when not.
 func (n *Node) appAttachedLocked(now time.Time, a *AttachedRoad) {
+	if n.paused { // it is offered on resume, with the other roads
+		return
+	}
 	ps := n.peerLocked(a.peer)
 	if ps == nil {
 		return
@@ -249,6 +264,9 @@ func (n *Node) appAttachedLocked(now time.Time, a *AttachedRoad) {
 
 // sealToLocked sends packet content on one endpoint only (a keepalive, a probe).
 func (n *Node) sealToLocked(s *session, e *epState, now time.Time, plain []byte) {
+	if n.paused {
+		return
+	}
 	hdr := put32(put32([]byte{pData}, s.remote), uint32(s.sendN))
 	pkt := s.send.Encrypt(append([]byte(nil), hdr...), s.sendN, hdr, plain)
 	s.sendN++

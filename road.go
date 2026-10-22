@@ -294,6 +294,11 @@ func (r *RelayRoad) session(channel string, c *relayChan) error {
 		return err
 	}
 	defer conn.Close()
+	select {
+	case <-c.stop: // closed while dialing (the node paused or closed): say nothing
+		return nil
+	default:
+	}
 	h, _ := json.Marshal(map[string]any{"relay": 1, "channel": channel, "role": c.role})
 	if _, err := conn.Write(append(h, '\n')); err != nil {
 		return err

@@ -19,6 +19,8 @@ type TCPRoad struct {
 	recv  func([]byte, Endpoint)
 	mu    sync.Mutex
 	conns map[string]*tcpConn // by remote address as we know it
+	// paused: no connections (the node pauses); the listener stays and refuses them
+	paused atomic.Bool
 
 	// Delay and Rate are for tests, as on UDPRoad.
 	Delay time.Duration
@@ -57,6 +59,10 @@ func listenTCP(addr string, recv func([]byte, Endpoint)) (*TCPRoad, error) {
 			if err != nil {
 				return
 			}
+			if t.paused.Load() {
+				c.Close()
+				continue
+			}
 			tc := t.newConn(c.RemoteAddr().String())
 			go t.serve(c, c.RemoteAddr().String(), tc)
 		}
@@ -89,6 +95,9 @@ func (tc *tcpConn) close() { tc.once.Do(func() { close(tc.stop) }) }
 func (t *TCPRoad) Send(addr string, pkt []byte) error {
 	if len(pkt) > MaxPacket+64 {
 		return errors.New("packet too big")
+	}
+	if t.paused.Load() {
+		return errors.New("paused")
 	}
 	t.mu.Lock()
 	tc := t.conns[addr]
@@ -210,14 +219,26 @@ func (t *TCPRoad) LocalAddr() string {
 	return t.ln.Addr().String()
 }
 
-func (t *TCPRoad) close() {
-	if t.ln != nil {
-		_ = t.ln.Close()
+// pause closes every connection and refuses new ones (on), or takes them again.
+func (t *TCPRoad) pause(on bool) {
+	t.paused.Store(on)
+	if on {
+		t.closeConns()
 	}
+}
+
+func (t *TCPRoad) closeConns() {
 	t.mu.Lock()
 	for k, tc := range t.conns {
 		tc.close()
 		delete(t.conns, k)
 	}
 	t.mu.Unlock()
+}
+
+func (t *TCPRoad) close() {
+	if t.ln != nil {
+		_ = t.ln.Close()
+	}
+	t.closeConns()
 }
