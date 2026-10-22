@@ -497,3 +497,18 @@ func TestReannounceOnNewAddress(t *testing.T) {
 	}
 	t.Fatal("b did not learn a's new address")
 }
+
+// Another network mid-conversation (a computer moves to the phone's hotspot): its address and
+// port change; the conversation goes on both ways — the session follows the new address.
+func TestConversationAcrossNetworkSwitch(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	echo(t, b, a, []byte("before"), 5*time.Second)
+	if err := a.RebindUDP("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	echo(t, b, a, []byte("after, from the phone"), 15*time.Second)
+	echo(t, a, b, []byte("after, from the computer"), 15*time.Second)
+}
