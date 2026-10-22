@@ -29,8 +29,23 @@ const (
 // application road (spec §7); tests shorten it.
 var probeEvery = 30 * time.Second
 
-// Handler is a tool method: arguments → result (or *Error).
+// Handler is a tool method: arguments → result (or *Error). A handler that would wait long
+// returns Later instead, so its stream goes on (spec §6).
 type Handler func(peer string, args []cbor.RawMessage) ([]any, error)
+
+// Later is what a handler returns to answer its call later (spec §6): the handler's turn on its
+// stream ends when it returns, so the stream's next calls and events run (a cancel among them),
+// and work runs in a goroutine of its own; what it returns is the call's result or error, sent
+// on the call's stream — unless the caller restarted meanwhile. Close does not wait for it.
+//
+//	n.Handle(1, 1, func(peer string, args []cbor.RawMessage) ([]any, error) {
+//		return nil, p2pact.Later(func() ([]any, error) { return runTurn(args) })
+//	})
+func Later(work func() ([]any, error)) error { return &later{work} }
+
+type later struct{ work func() ([]any, error) }
+
+func (*later) Error() string { return "answered later" }
 
 // Error is a call error (spec §6): a code and a text.
 type Error struct {
@@ -312,7 +327,8 @@ func (n *Node) Close() {
 }
 
 // Handle registers method tool.method. Calls of one device on one stream run one at a time,
-// in the order sent, together with its events there (spec §6); other streams do not wait.
+// in the order sent, together with its events there (spec §6); other streams do not wait. A
+// handler that waits long returns Later, so that the stream goes on without it.
 func (n *Node) Handle(tool, method int, h Handler) {
 	n.mu.Lock()
 	n.handlers[[2]int{tool, method}] = h
@@ -906,11 +922,9 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 		h := n.handlers[[2]int{tool, method}]
 		args := a[4:]
 		boot := ps.boot
-		run := func() {
+		reply := func(res []any, err error) {
 			var out []any
-			if h == nil {
-				out = []any{2, id, ErrNoMethod, "no such method"}
-			} else if res, err := h(peer, args); err != nil {
+			if err != nil {
 				var e *Error
 				if !errors.As(err, &e) {
 					e = &Error{Code: ErrFailed, Text: err.Error()}
@@ -926,6 +940,19 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 				n.pushLocked(ps, b, stream, tool != 0, true)
 			}
 			n.mu.Unlock()
+		}
+		run := func() {
+			if h == nil {
+				reply(nil, &Error{Code: ErrNoMethod, Text: "no such method"})
+				return
+			}
+			res, err := h(peer, args)
+			var l *later
+			if errors.As(err, &l) { // the turn ends here; the reply goes when the work is done
+				go func() { reply(l.work()) }()
+				return
+			}
+			reply(res, err)
 		}
 		if tool == 0 { // service calls (a dictionary, a ping) never wait behind a slow handler
 			go run()

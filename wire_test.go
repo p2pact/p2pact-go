@@ -13,6 +13,7 @@ import (
 	"math/big"
 	mrand "math/rand"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -407,5 +408,73 @@ func TestRestartWithPartsInFlight(t *testing.T) {
 		if n != 1 {
 			t.Errorf("%q ran %d times", s, n)
 		}
+	}
+}
+
+// A handler that answers later lets its stream go on: an event and a call sent behind it run
+// (in the order sent) while it waits, and its result comes when the work is done.
+func TestAnswerLater(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var started []string
+	note := func(s string) {
+		mu.Lock()
+		started = append(started, s)
+		mu.Unlock()
+	}
+	b.Handle(64, 2, func(_ string, args []cbor.RawMessage) ([]any, error) { // an agent's turn
+		note("long")
+		return nil, Later(func() ([]any, error) {
+			<-release
+			return []any{"done"}, nil
+		})
+	})
+	b.Handle(64, 3, func(_ string, _ []cbor.RawMessage) ([]any, error) {
+		note("call")
+		return []any{"quick"}, nil
+	})
+	b.mu.Lock()
+	b.OnEvent = func(_ string, _, _ int, _ []cbor.RawMessage) { note("event") }
+	b.mu.Unlock()
+	long := make(chan string, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		res, err := a.CallOn(ctx, b.ID.Addr(), 2, 64, 2)
+		var s string
+		if err == nil && len(res) == 1 {
+			_ = cbor.Unmarshal(res[0], &s)
+		}
+		long <- s
+	}()
+	time.Sleep(50 * time.Millisecond)
+	_ = a.EventOn(b.ID.Addr(), 2, 64, 1) // a cancel, say
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := a.CallOn(ctx, b.ID.Addr(), 2, 64, 3); err != nil {
+		t.Fatalf("a call behind the long one waited for it: %v", err)
+	}
+	mu.Lock()
+	if got := strings.Join(started, " "); got != "long event call" {
+		t.Fatalf("started out of order: %s", got)
+	}
+	mu.Unlock()
+	select {
+	case s := <-long:
+		t.Fatalf("the long call was answered before its work was done: %q", s)
+	default:
+	}
+	close(release)
+	select {
+	case s := <-long:
+		if s != "done" {
+			t.Fatalf("the long call got %q", s)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer given later did not arrive")
 	}
 }

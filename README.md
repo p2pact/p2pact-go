@@ -38,6 +38,10 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
 - `Call` / `Handle` — calls and results; `Event` / `OnEvent` — events in either direction.
 - `CallOn` / `EventOn` — the same on a **stream**: in order within it, independent of other
   streams, so a loss on one chat does not hold up the others. Use one stream per chat.
+  A stream's calls and events run one at a time, in the order sent.
+- `Later` — a handler that waits long (an agent's turn, a person's answer) returns
+  `nil, p2pact.Later(work)`: its stream goes on at once, and what `work` returns is sent when
+  it is ready.
 - `SetAdvertise` — announce given addresses instead of your own (port forwarding, a public
   address).
 - `AddDict(p2pact.CommonDict)` — the common compression dictionary (spec §5), used until the

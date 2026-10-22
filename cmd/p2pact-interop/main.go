@@ -7,6 +7,10 @@
 //	{"cmd":"join","invite":"…"}                               → {"peer":"…"}
 //	{"cmd":"known","peer":"…"}                                → {"known":true|false}
 //	{"cmd":"call","peer":"…","data":"<base64>","stream":N}    → {"data":"<base64>"}  (echo, tool 64 method 1; stream optional)
+//	{"cmd":"later","peer":"…","data":"<base64>","stream":N}   → {"data":"<base64>"}
+//	  a call answered later (spec §6): calls tool 64 method 2 on the stream, which the other
+//	  side holds until a 64.1 call reaches it, then a 64.1 call on the same stream; answers with
+//	  the 64.2 result, or an error if the 64.1 call waited behind the held one
 //	{"cmd":"dict","raw":"<base64>"}                           → {"ok":true}
 //	{"cmd":"road","listen":"127.0.0.1:0","mtu":20,"rate":N}   → {"road":"127.0.0.1:…"}
 //	{"cmd":"road","dial":"127.0.0.1:…","mtu":20,"rate":N,"peer":"…"} → {"ok":true}
@@ -22,8 +26,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -48,12 +54,40 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// 64.2 echoes too, but answers later: once a 64.1 call has run after it (on its stream, that
+	// call is behind it; it passes only if the held call does not hold up the stream)
+	var mu sync.Mutex
+	var held []chan struct{}
 	n.Handle(64, 1, func(_ string, args []cbor.RawMessage) ([]any, error) {
 		var b []byte
 		if len(args) == 0 || cbor.Unmarshal(args[0], &b) != nil {
 			return nil, &p2pact.Error{Code: p2pact.ErrBadArgs, Text: "no data"}
 		}
+		mu.Lock()
+		for _, c := range held {
+			close(c)
+		}
+		held = nil
+		mu.Unlock()
 		return []any{b}, nil
+	})
+	n.Handle(64, 2, func(_ string, args []cbor.RawMessage) ([]any, error) {
+		var b []byte
+		if len(args) == 0 || cbor.Unmarshal(args[0], &b) != nil {
+			return nil, &p2pact.Error{Code: p2pact.ErrBadArgs, Text: "no data"}
+		}
+		c := make(chan struct{})
+		mu.Lock()
+		held = append(held, c)
+		mu.Unlock()
+		return nil, p2pact.Later(func() ([]any, error) {
+			select {
+			case <-c:
+				return []any{b}, nil
+			case <-time.After(30 * time.Second):
+				return nil, &p2pact.Error{Code: p2pact.ErrFailed, Text: "no call came behind"}
+			}
+		})
 	})
 	n.Start()
 	out := json.NewEncoder(os.Stdout)
@@ -124,6 +158,36 @@ func main() {
 			}
 			if err != nil {
 				fail(err)
+				continue
+			}
+			say(map[string][]byte{"data": b})
+		case "later":
+			type answer struct {
+				res []cbor.RawMessage
+				err error
+			}
+			first := make(chan answer, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				res, err := n.CallOn(ctx, req.Peer, req.Stream, 64, 2, req.Data)
+				first <- answer{res, err}
+			}()
+			time.Sleep(100 * time.Millisecond) // the held call goes first
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_, err := n.CallOn(ctx, req.Peer, req.Stream, 64, 1, []byte("behind"))
+			cancel()
+			if err != nil {
+				fail(fmt.Errorf("the call behind the held one: %w", err))
+				continue
+			}
+			a := <-first
+			var b []byte
+			if a.err == nil && (len(a.res) == 0 || cbor.Unmarshal(a.res[0], &b) != nil) {
+				a.err = os.ErrInvalid
+			}
+			if a.err != nil {
+				fail(fmt.Errorf("the held call: %w", a.err))
 				continue
 			}
 			say(map[string][]byte{"data": b})
