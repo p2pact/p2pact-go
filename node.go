@@ -461,7 +461,7 @@ func (n *Node) CallOn(ctx context.Context, peer string, stream uint64, tool, met
 	}
 	msg, err := cbor.Marshal(append([]any{0, id, tool, method}, args...))
 	if err == nil {
-		n.pushLocked(ps, msg, stream, tool != 0)
+		n.pushLocked(ps, msg, stream, tool != 0, false)
 	}
 	n.mu.Unlock()
 	if err != nil {
@@ -498,7 +498,7 @@ func (n *Node) EventOn(peer string, stream uint64, tool, event int, args ...any)
 	if ps == nil {
 		return errors.New("unknown device")
 	}
-	n.pushLocked(ps, msg, stream, tool != 0)
+	n.pushLocked(ps, msg, stream, tool != 0, false)
 	return nil
 }
 
@@ -839,7 +839,7 @@ func (n *Node) bootLocked(ps *peerState, boot uint32) {
 // sendInfoLocked sends our hello: name and where to find us (event 0.2).
 func (n *Node) sendInfoLocked(peer string) {
 	msg, _ := cbor.Marshal(append([]any{3, 0, 2}, n.infoLocked(peer)...))
-	n.pushLocked(n.peerLocked(peer), msg, 0, false)
+	n.pushLocked(n.peerLocked(peer), msg, 0, false, false)
 }
 
 // messageLocked handles a reassembled message (spec §6).
@@ -868,6 +868,7 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 		}
 		h := n.handlers[[2]int{tool, method}]
 		args := a[4:]
+		boot := ps.boot
 		go func() {
 			var out []any
 			if h == nil {
@@ -883,8 +884,9 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			}
 			b, _ := cbor.Marshal(out)
 			n.mu.Lock()
-			if ps := n.peerLocked(peer); ps != nil {
-				n.pushLocked(ps, b, stream, tool != 0) // the result goes back on the call's stream
+			// the result goes back on the call's stream, unless the caller restarted meanwhile
+			if ps := n.peerLocked(peer); ps != nil && (boot == 0 || ps.boot == boot) {
+				n.pushLocked(ps, b, stream, tool != 0, true)
 			}
 			n.mu.Unlock()
 		}()
@@ -1262,11 +1264,12 @@ func (n *Node) wakeLocked() {
 // pushLocked queues a message, compressed when worth it: with our dictionary for this device,
 // else the newest one it also has. The slot refers to our list at send time: the list changes
 // only through event 0.5, which travels in the same order as messages.
-// talk: the message is conversation (not tool 0), so it goes to the history (learn.go).
-func (n *Node) pushLocked(ps *peerState, msg []byte, stream uint64, talk bool) {
+// talk: the message is conversation (not tool 0), so it goes to the history (learn.go);
+// reply: a result or error, dropped if the other device restarts (§4.2).
+func (n *Node) pushLocked(ps *peerState, msg []byte, stream uint64, talk, reply bool) {
 	defer n.wakeLocked()
 	if n.NoCompression {
-		ps.st.push(msg, false, stream)
+		ps.st.push(msg, false, stream, reply)
 		return
 	}
 	d, slot := n.dicts.pick(ps.addr, ps.dicts, ps.lacks)
@@ -1275,10 +1278,10 @@ func (n *Node) pushLocked(ps *peerState, msg []byte, stream uint64, talk bool) {
 		n.learnLocked(ps, msg, d, z)
 	}
 	if z != nil {
-		ps.st.push(z, true, stream)
+		ps.st.push(z, true, stream, reply)
 		return
 	}
-	ps.st.push(msg, false, stream)
+	ps.st.push(msg, false, stream, reply)
 }
 
 // inboundLocked decompresses a reassembled message and runs it in order. A missing
@@ -1458,7 +1461,7 @@ func (n *Node) addDictLocked(d *Dict) error {
 		}
 		if ps := n.peerLocked(p.Addr); ps != nil {
 			msg, _ := cbor.Marshal([]any{3, 0, 5, n.dicts.ids(p.Addr)})
-			ps.st.push(msg, false, 0)
+			ps.st.push(msg, false, 0, false)
 		}
 	}
 	n.wakeLocked()

@@ -48,16 +48,18 @@ const (
 )
 
 type part struct {
-	seq       uint32
-	data      []byte
-	more      bool
-	zip       bool
-	stream    uint64    // 0 — the ordered default stream
-	num       uint64    // message number in its stream (from 1), on the first part
-	first     bool      // first part of a message on a stream
-	firstSent time.Time // first sent at (zero — not sent yet)
-	sent      time.Time
-	tries     int
+	seq    uint32
+	data   []byte
+	more   bool
+	zip    bool
+	stream uint64      // 0 — the ordered default stream
+	num    uint64      // message number in its stream (from 1), on the first part
+	first  bool        // first part of a message on a stream
+	reply  bool        // part of a result or error: it answers a call of this boot only
+	copies []time.Time // when each copy was sent
+	timer  bool        // the last copy went because the timer ran out
+	sent   time.Time
+	tries  int
 	// bytes delivered when this part was sent: its ack gives a delivery-rate sample
 	delivered int64
 }
@@ -231,7 +233,9 @@ func (s *stream) lost(now time.Time) {
 }
 
 // reset handles a restart of the other device: its receiving started from zero. Our
-// unacknowledged parts are renumbered from 1; receiving restarts from 1 too.
+// unacknowledged parts are renumbered from 1; receiving restarts from 1 too. Replies are
+// dropped: the calls they answer ended with the restart, and the new call ids start from 1
+// again, so a stale reply would answer a new call.
 func (s *stream) reset() {
 	var pending []*part
 	for _, p := range s.inflight {
@@ -241,8 +245,15 @@ func (s *stream) reset() {
 	pending = append(pending, s.queue...)
 	s.next, s.inflight, s.queue, s.inflightBytes = 1, map[uint32]*part{}, nil, 0
 	s.resetRecv()
+	// the path may be another one now: measure it afresh (a stale minimum round trip would
+	// read every round trip as a queue, or every ack of a retransmission as a real one)
+	s.cwnd, s.ssthresh, s.lastCut = cwndStart, cwndMax, time.Time{}
+	s.srtt, s.rttvar, s.minRTT, s.bw, s.bwAt = 0, 0, 0, 0, time.Time{}
 	for _, p := range pending {
-		p.seq, p.firstSent, p.sent, p.tries = s.next, time.Time{}, time.Time{}, 0
+		if p.reply {
+			continue
+		}
+		p.seq, p.copies, p.sent, p.tries, p.timer = s.next, nil, time.Time{}, 0, false
 		s.next++
 		if p.first { // the other side expects each stream from message 1 again
 			s.snext[p.stream]++
@@ -253,8 +264,8 @@ func (s *stream) reset() {
 }
 
 // push queues a message in parts on a stream (0 — the ordered default); zip marks it
-// compressed.
-func (s *stream) push(msg []byte, zip bool, stream uint64) {
+// compressed, reply — a result or error.
+func (s *stream) push(msg []byte, zip bool, stream uint64, reply bool) {
 	var num uint64
 	if stream != 0 {
 		s.snext[stream]++
@@ -263,7 +274,7 @@ func (s *stream) push(msg []byte, zip bool, stream uint64) {
 	first := true
 	for {
 		n := min(len(msg), maxPart)
-		p := &part{seq: s.next, data: msg[:n], more: n < len(msg), zip: zip, stream: stream}
+		p := &part{seq: s.next, data: msg[:n], more: n < len(msg), zip: zip, stream: stream, reply: reply}
 		if stream != 0 && first {
 			p.first, p.num = true, num
 		}
@@ -294,6 +305,7 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 	}
 	if p != nil {
 		retry = true
+		p.timer = !p.sent.IsZero() // not taken as lost by an ack: the timer ran out
 		s.lost(now)
 	} else if len(s.queue) > 0 && s.canSend() {
 		p = s.queue[0]
@@ -331,9 +343,7 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 			flags |= fCont
 		}
 		b = append(b, p.data...)
-		if p.firstSent.IsZero() {
-			p.firstSent = now
-		}
+		p.copies = append(p.copies, now)
 		p.delivered = s.delivered
 		p.sent = now
 		p.tries++
@@ -402,8 +412,23 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 			if p == nil {
 				return
 			}
-			if p.sent.After(newest) {
-				newest = p.sent
+			// an ack sooner than the minimum round trip after a timer's copy is for an earlier
+			// copy: the timer fired on a queue, not a loss (RFC 8985 §6.2). The newest copy's
+			// time would declare every part sent between the copies lost, and their copies
+			// would fire the same way, again and again. The ack is not ambiguous, so it is a
+			// round-trip sample (Karn's rule skips it otherwise): without one the timer
+			// would stay shorter than the queue for good.
+			sent := p.sent
+			if p.timer && now.Sub(p.sent) < s.minRTT {
+				for i, c := range p.copies {
+					if i == 0 || now.Sub(c) >= s.minRTT {
+						sent = c
+					}
+				}
+				s.sample(now.Sub(sent))
+			}
+			if sent.After(newest) {
+				newest = sent
 			}
 			s.delivered += int64(len(p.data))
 			if p.tries == 1 {

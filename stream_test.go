@@ -13,7 +13,7 @@ func TestStreamHalfLoss(t *testing.T) {
 	r := mrand.New(mrand.NewSource(2))
 	data := make([]byte, 200<<10)
 	r.Read(data)
-	a.push(data, false, 0)
+	a.push(data, false, 0, false)
 	var got []byte
 	now := time.Unix(0, 0)
 	for step := 0; step < 200000 && got == nil; step++ {
@@ -46,9 +46,9 @@ func TestStreamHalfLoss(t *testing.T) {
 // another stream is lost; within a stream the order holds.
 func TestStreamsIndependent(t *testing.T) {
 	a, b := newStream(), newStream()
-	a.push([]byte("s1 first"), false, 1)
-	a.push([]byte("s2 only"), false, 2)
-	a.push([]byte("s1 second"), false, 1)
+	a.push([]byte("s1 first"), false, 1, false)
+	a.push([]byte("s2 only"), false, 2, false)
+	a.push([]byte("s1 second"), false, 1, false)
 	now := time.Now()
 	var pkts [][]byte
 	for {
@@ -72,5 +72,54 @@ func TestStreamsIndependent(t *testing.T) {
 	ack, _ := b.nextPacket(now, true)
 	if err := a.receive(now, ack, func([]byte, bool, uint64) {}); err != nil || len(a.inflight) != 0 {
 		t.Fatalf("ack ranges: %v, %d still in flight", err, len(a.inflight))
+	}
+}
+
+// A timeout fired by a queue, not a loss: the ack of the first copy comes just after the
+// retransmission and must not mark the parts sent between the copies lost (spec §5).
+func TestStreamSpuriousRetransmission(t *testing.T) {
+	a, b := newStream(), newStream()
+	t0 := time.Unix(0, 0)
+	exchange := func(at time.Time, pkts ...[]byte) {
+		for _, p := range pkts {
+			_ = b.receive(at, p, func([]byte, bool, uint64) {})
+		}
+		ack, _ := b.nextPacket(at, true)
+		_ = a.receive(at.Add(time.Millisecond), ack, nil)
+	}
+	a.push([]byte("first"), false, 1, false) // a round-trip sample: 60 ms
+	p, _ := a.nextPacket(t0, false)
+	exchange(t0.Add(59*time.Millisecond), p)
+	sent := t0.Add(100 * time.Millisecond)
+	var pkts [][]byte
+	for i := 0; i < 5; i++ {
+		a.push([]byte("queued"), false, 1, false)
+		p, _ := a.nextPacket(sent, false)
+		pkts = append(pkts, p)
+	}
+	at := sent.Add(a.timeout(a.inflight[2], 0))
+	if _, retry := a.nextPacket(at, false); !retry {
+		t.Fatal("no retransmission on timeout")
+	}
+	exchange(at.Add(time.Millisecond), pkts[0]) // the first copy, late behind a queue
+	for seq, p := range a.inflight {
+		if p.sent.IsZero() {
+			t.Fatalf("part %d taken as lost", seq)
+		}
+	}
+}
+
+// The other device restarted: our unacknowledged calls go again, renumbered; replies to its
+// old calls are dropped — they would answer its new calls with the same ids.
+func TestStreamResetDropsReplies(t *testing.T) {
+	a := newStream()
+	a.push([]byte("call"), false, 1, false)
+	a.push([]byte("reply"), false, 2, true)
+	a.push([]byte("queued reply"), false, 2, true)
+	_, _ = a.nextPacket(time.Now(), false)
+	_, _ = a.nextPacket(time.Now(), false)
+	a.reset()
+	if len(a.queue) != 1 || string(a.queue[0].data) != "call" || a.queue[0].seq != 1 || a.next != 2 {
+		t.Fatalf("after the restart: %d queued, next %d", len(a.queue), a.next)
 	}
 }

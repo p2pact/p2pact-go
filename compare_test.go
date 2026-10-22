@@ -31,7 +31,7 @@ func ourBytes(msg []any) int {
 	b, _ := cbor.Marshal(msg)
 	s := newStream()
 	s.recvAck = 2 // something to ack, as in a live conversation
-	s.push(b, false, 0)
+	s.push(b, false, 0, false)
 	plain, _ := s.nextPacket(time.Now(), false)
 	return dataHeader + len(plain) + 16
 }
