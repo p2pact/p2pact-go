@@ -114,9 +114,8 @@ func (n *Node) saveLocked(h *history, m []byte, heard bool) {
 	if h.fileSize+int64(len(h.buf)) > 2*(learnMax+learnHeard) {
 		h.rewrite = true
 	}
-	if !h.flushing {
+	if !h.flushing && n.goLocked(func() { n.flushHistory(h) }) {
 		h.flushing = true
-		go n.flushHistory(h)
 	}
 }
 
@@ -301,7 +300,7 @@ func (n *Node) considerLocked(ps *peerState, h *history, now time.Time) {
 	h.due, h.worse, h.training = "", false, true
 	ownMsgs := append([][]byte(nil), h.own...)
 	heard := append([][]byte(nil), h.heard[len(h.heard)-countFrom(h.heard, max(0, learnHeard-h.ownSize)):]...)
-	go func() {
+	if !n.goLocked(func() {
 		n.train <- struct{}{}
 		defer func() { <-n.train }()
 		// tested on our newest messages: the dictionary is for what we send
@@ -337,7 +336,9 @@ func (n *Node) considerLocked(ps *peerState, h *history, now time.Time) {
 		if n.addDictLocked(d) == nil {
 			h.plain, h.zips, h.base = 0, 0, 0
 		}
-	}()
+	}) {
+		h.training = false
+	}
 }
 
 // countFrom is how many of the newest messages fit in n bytes.

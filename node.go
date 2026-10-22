@@ -1496,10 +1496,10 @@ func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte, waiting bo
 		return
 	}
 	ps.fetching = true
-	go func() {
+	if !n.goLocked(func() {
 		var d *Dict
 		for try := 0; try < 3 && d == nil; try++ {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := n.stopContext(30 * time.Second)
 			res, err := n.Call(ctx, peer, 0, 5, id)
 			cancel()
 			var raw []byte
@@ -1526,7 +1526,35 @@ func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte, waiting bo
 		}
 		n.drainLocked(peer, ps)
 		n.fetchNewLocked(peer, ps)
+	}) {
+		ps.fetching = false
+	}
+}
+
+// goLocked runs f in the background and Close waits for it; once the node is closing nothing
+// starts (false). Under n.mu: Close stops the node before it takes the lock.
+func (n *Node) goLocked(f func()) bool {
+	select {
+	case <-n.stop:
+		return false
+	default:
+	}
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); f() }()
+	return true
+}
+
+// stopContext is a context that ends after d or when the node closes.
+func (n *Node) stopContext(d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	go func() {
+		select {
+		case <-n.stop:
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
+	return ctx, cancel
 }
 
 // dictHandler serves 0.5 dict [id] → dictionary bytes. A device that asks lacks it, so we
