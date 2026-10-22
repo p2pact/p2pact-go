@@ -116,6 +116,8 @@ type peerState struct {
 	dicts     [][]byte  // its dictionaries (ids), newest first — from its hello and 0.5
 	lacks     [][]byte  // it asked us for these, so it lacks them until it announces again
 	waiting   []inbound // waiting for a dictionary (spec §5): run in order once it arrives
+	// waitSince: when the head of waiting started to wait (maintainLocked unblocks it)
+	waitSince time.Time
 	fetching  bool
 	// askingInfo: our 0.2 info call is on its way (askInfoLocked); askedInfo: when we asked
 	askingInfo bool
@@ -153,6 +155,9 @@ type Node struct {
 	OnPaired func(p Peer)
 	// OnHello is called when a known device sends its hello (new session or pairing).
 	OnHello func(peer string)
+	// OnHeld is called when messages from a device waited too long for a dictionary or its list
+	// and were dropped (held — how many): the application can tell the user or resend.
+	OnHeld func(peer string, held int)
 	// NoCompression turns compression off for what we send (benchmarks, debugging).
 	NoCompression bool
 	// NoLearning: do not train our own dictionaries on what we send (spec §5).
@@ -1446,6 +1451,7 @@ func (n *Node) maintainLocked(now time.Time) {
 			n.probeLocked(now, p.Addr, ps, s)
 		}
 	}
+	n.unholdLocked(now)
 	for idx, s := range n.sessions {
 		if n.current[s.peer] != s && now.Sub(s.lastRecv) > sessionIdle {
 			delete(n.sessions, idx)
@@ -1461,6 +1467,40 @@ func (n *Node) maintainLocked(now time.Time) {
 			delete(n.invites, id)
 			if n.own != nil {
 				n.relayLocked(*n.own).leave(id)
+			}
+		}
+	}
+}
+
+// Held messages (spec §5): a device's messages wait for its dictionary or its list. That must
+// not last: after holdAsk we ask again (its hello, the dictionary); after holdDrop the held
+// messages are dropped — the sender resends what matters — and the lists are learnt anew.
+var (
+	holdAsk  = 15 * time.Second
+	holdDrop = 2 * time.Minute
+)
+
+func (n *Node) unholdLocked(now time.Time) {
+	for peer, ps := range n.peers {
+		if len(ps.waiting) == 0 {
+			continue
+		}
+		held := now.Sub(ps.waitSince)
+		switch {
+		case held >= holdDrop:
+			k := len(ps.waiting)
+			ps.waiting, ps.fetching, ps.askingInfo = nil, false, false
+			ps.dicts, ps.lacks, ps.tried = nil, nil, nil
+			n.sendInfoLocked(peer) // ours again: the other side re-learns what we have
+			if on := n.OnHeld; on != nil {
+				go on(peer, k)
+			}
+		case held >= holdAsk:
+			if len(ps.dicts) == 0 {
+				n.askInfoLocked(peer, ps)
+			} else {
+				ps.tried = nil
+				n.drainLocked(peer, ps)
 			}
 		}
 	}
@@ -1535,6 +1575,9 @@ func (n *Node) inboundLocked(peer string, msg []byte, zip bool, stream uint64) {
 			n.drainLocked(peer, ps)
 			return
 		}
+	}
+	if len(ps.waiting) == 0 {
+		ps.waitSince = time.Now()
 	}
 	ps.waiting = append(ps.waiting, inbound{msg, zip, stream})
 	n.drainLocked(peer, ps)

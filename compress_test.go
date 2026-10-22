@@ -192,3 +192,35 @@ func TestGuessCompressedHello(t *testing.T) {
 		t.Fatal("bootstrap")
 	}
 }
+
+// Messages held for a list that never comes are not held forever: they are dropped (the
+// sender resends what matters), the application is told, and the lists are learnt anew.
+func TestHeldDropped(t *testing.T) {
+	oldAsk, oldDrop := holdAsk, holdDrop
+	holdAsk, holdDrop = 200*time.Millisecond, time.Second
+	defer func() { holdAsk, holdDrop = oldAsk, oldDrop }()
+	a, b := node(t, "Phone", true, nil), node(t, "Mac", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	raw := testDict(t, 0)
+	_ = a.AddDict(raw)
+	_ = b.AddDict(raw)
+	waitDicts(t, a, b, 1)
+	waitDicts(t, b, a, 1)
+	a.Handle(0, 2, func(string, []cbor.RawMessage) ([]any, error) { return nil, &Error{Code: ErrFailed, Text: "no"} })
+	held := make(chan int, 1)
+	b.OnHeld = func(_ string, k int) { held <- k }
+	b.mu.Lock()
+	b.peers[a.ID.Addr()].dicts = nil // b lost a's list, and a will not tell it
+	b.mu.Unlock()
+	_ = a.Event(b.ID.Addr(), 9, 1, string(longText))
+	select {
+	case k := <-held:
+		if k < 1 {
+			t.Fatalf("held %d", k)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("held messages were never dropped")
+	}
+}
