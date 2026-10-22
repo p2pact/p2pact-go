@@ -117,13 +117,16 @@ type peerState struct {
 	lacks     [][]byte  // it asked us for these, so it lacks them until it announces again
 	waiting   []inbound // waiting for a dictionary (spec §5): run in order once it arrives
 	fetching  bool
-	tried     [][]byte        // dictionaries of its list we asked it for and did not get
-	hist      *history        // what we sent it and got from it, to train our dictionary for it
-	sysCalls  map[uint64]bool // our calls of tool 0: their results are not conversation
-	queue     []pending       // conversation messages waiting to be learnt (learn.go)
-	queued    int
-	lastTalk  time.Time
-	inbox     map[uint64]*inbox // calls and events waiting for their turn, per stream
+	// askingInfo: our 0.2 info call is on its way (askInfoLocked); askedInfo: when we asked
+	askingInfo bool
+	askedInfo  time.Time
+	tried      [][]byte        // dictionaries of its list we asked it for and did not get
+	hist       *history        // what we sent it and got from it, to train our dictionary for it
+	sysCalls   map[uint64]bool // our calls of tool 0: their results are not conversation
+	queue      []pending       // conversation messages waiting to be learnt (learn.go)
+	queued     int
+	lastTalk   time.Time
+	inbox      map[uint64]*inbox // calls and events waiting for their turn, per stream
 }
 
 type inbound struct {
@@ -1007,7 +1010,12 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			n.mu.Lock()
 			// the result goes back on the call's stream, unless the caller restarted meanwhile
 			if ps := n.peerLocked(peer); ps != nil && (boot == 0 || ps.boot == boot) {
-				n.pushLocked(ps, b, stream, tool != 0, true)
+				if tool == 0 && method == 2 { // a hello, like the event: never compressed
+					ps.st.push(b, false, stream, true)
+					n.wakeLocked()
+				} else {
+					n.pushLocked(ps, b, stream, tool != 0, true)
+				}
 			}
 			n.mu.Unlock()
 		}
@@ -1495,7 +1503,7 @@ func (n *Node) wakeLocked() {
 // reply: a result or error, dropped if the other device restarts (§4.2).
 func (n *Node) pushLocked(ps *peerState, msg []byte, stream uint64, talk, reply bool) {
 	defer n.wakeLocked()
-	if n.NoCompression {
+	if n.NoCompression || bootstrap(msg) {
 		ps.st.push(msg, false, stream, reply)
 		return
 	}
@@ -1546,6 +1554,14 @@ func (n *Node) drainLocked(peer string, ps *peerState) {
 			ps.waiting = ps.waiting[1:]
 			continue
 		case errors.Is(err, errNoList):
+			// a sender of an older version compresses its hello too: then we would wait for it
+			// forever. Try the dictionaries we have for it — only a hello or a list is taken
+			if plain := n.guessBootstrapLocked(ps, w.msg); plain != nil {
+				ps.waiting = ps.waiting[1:]
+				n.messageLocked(peer, plain, w.stream)
+				continue
+			}
+			n.askInfoLocked(peer, ps)
 			return // wait for a hello or 0.5
 		}
 		ps.waiting = ps.waiting[1:]
@@ -1557,6 +1573,52 @@ func (n *Node) drainLocked(peer string, ps *peerState) {
 }
 
 var errNoList = errors.New("sender dictionary list not received yet")
+
+// guessBootstrapLocked decompresses a message whose slot is beyond the sender's list we know
+// with each dictionary the sender may have used for us (the pair's and the common ones); only
+// a hello or a dictionary list is accepted, nil — none fits.
+func (n *Node) guessBootstrapLocked(ps *peerState, msg []byte) []byte {
+	if len(msg) < 2 || msg[0] == 0 {
+		return nil
+	}
+	for _, d := range n.dicts.list(ps.addr) {
+		plain, err := decompress(msg, d)
+		if err != nil || !bootstrap(plain) {
+			continue
+		}
+		var a []cbor.RawMessage
+		if cbor.Unmarshal(plain, &a) == nil {
+			return plain
+		}
+	}
+	return nil
+}
+
+// askInfoLocked asks the device for its hello (0.2 info) when we hold its messages without
+// its list: it may never send the event again on its own. One at a time; a newer device
+// answers uncompressed, an older one — with a slot we may guess (guessBootstrapLocked).
+func (n *Node) askInfoLocked(peer string, ps *peerState) {
+	if ps.askingInfo || time.Since(ps.askedInfo) < 10*time.Second {
+		return
+	}
+	ps.askingInfo, ps.askedInfo = true, time.Now()
+	if !n.goLocked(func() {
+		ctx, cancel := n.stopContext(30 * time.Second)
+		res, err := n.Call(ctx, peer, 0, 2)
+		cancel()
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		ps.askingInfo = false
+		if err != nil || len(res) < 5 || len(ps.dicts) > 0 {
+			return
+		}
+		_ = cbor.Unmarshal(res[4], &ps.dicts)
+		n.fetchNewLocked(peer, ps)
+		n.drainLocked(peer, ps)
+	}) {
+		ps.askingInfo = false
+	}
+}
 
 // unzipLocked decompresses a message; errNoDict — we lack the dictionary in that slot,
 // errNoList — the slot is beyond the list we know.
@@ -1577,6 +1639,13 @@ func (n *Node) unzipLocked(ps *peerState, msg []byte, zip bool) ([]byte, error) 
 		}
 	}
 	return decompress(msg, d)
+}
+
+// bootstrap reports a hello or a dictionary list ([3, 0, 2|5, …]): they carry what the
+// receiver needs to decompress, so they always go uncompressed — a device that restarted (and
+// lost our list) must be able to read them.
+func bootstrap(msg []byte) bool {
+	return len(msg) > 3 && msg[1] == 3 && msg[2] == 0 && (msg[3] == 2 || msg[3] == 5)
 }
 
 // outOfOrder reports messages that may run out of order: a result or error for our call

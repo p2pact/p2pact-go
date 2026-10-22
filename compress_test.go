@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/klauspost/compress/dict"
 )
 
@@ -145,5 +146,49 @@ func TestMissingDictFetched(t *testing.T) {
 	}
 	if got := b.Dicts(a.ID.Addr()); len(got) != 1 || !bytes.Equal(got[0], DictID(raw)) {
 		t.Fatal("b should have got the dictionary from a")
+	}
+}
+
+// The receiver lost the sender's list (it restarted, the hello did not come again) while the
+// sender keeps compressing: the receiver asks for the hello (0.2 info) and runs the messages.
+func TestLostListAsksInfo(t *testing.T) {
+	a, b := node(t, "Phone", true, nil), node(t, "Mac", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	raw := testDict(t, 0)
+	_ = a.AddDict(raw)
+	_ = b.AddDict(raw)
+	waitDicts(t, a, b, 1)
+	waitDicts(t, b, a, 1)
+	b.mu.Lock()
+	b.peers[a.ID.Addr()].dicts = nil // b no longer knows a's list
+	b.mu.Unlock()
+	for range 3 {
+		echo(t, a, b, longText, 15*time.Second)
+	}
+}
+
+// A sender of an older version compressed its hello: the receiver without its list reads it
+// with a dictionary it has for that sender. Only a hello or a list is taken this way.
+func TestGuessCompressedHello(t *testing.T) {
+	b := node(t, "Mac", true, nil)
+	defer b.Close()
+	d, _ := NewDict(testDict(t, 0))
+	b.mu.Lock()
+	_ = b.addDictLocked(d)
+	ps := &peerState{addr: "phone"}
+	hello, _ := cbor.Marshal([]any{3, 0, 2, "Phone", "android", "p2pact-kotlin", map[int]int{}, [][]byte{d.ID}, map[string]any{},
+		string(longText)})
+	z := compress(hello, d, 7)
+	other, _ := cbor.Marshal([]any{3, 64, 1, string(longText)})
+	zo := compress(other, d, 7)
+	got, gotOther := b.guessBootstrapLocked(ps, z), b.guessBootstrapLocked(ps, zo)
+	b.mu.Unlock()
+	if z == nil || !bytes.Equal(got, hello) || gotOther != nil {
+		t.Fatalf("hello %v, other %v", got != nil, gotOther != nil)
+	}
+	if !bootstrap(hello) || bootstrap(other) {
+		t.Fatal("bootstrap")
 	}
 }
