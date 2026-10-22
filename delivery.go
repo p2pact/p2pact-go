@@ -45,6 +45,9 @@ const (
 	cwndMax   = 4096     // ~4.5 MB in flight
 	gotMax    = 8192     // parts held above the first gap
 	msgMax    = 16 << 20 // longer messages abort reassembly
+	// linkQueue is how much of an application road's rate may be in flight: the first window
+	// on a slow link (Bluetooth), and a bound on the queue in it that the timers wait behind
+	linkQueue = time.Second
 )
 
 type part struct {
@@ -62,6 +65,8 @@ type part struct {
 	tries  int
 	// bytes delivered when this part was sent: its ack gives a delivery-rate sample
 	delivered int64
+	// the link was busy when it was sent: other parts were in flight ahead of it
+	busy bool
 }
 
 // stream is delivery to one device, both directions.
@@ -80,7 +85,8 @@ type stream struct {
 	// in flight we keep at most what the link delivers in two round trips
 	delivered     int64
 	inflightBytes int64
-	reliable      bool // the current road is a reliable stream: no window of our own
+	reliable      bool    // the current road is a reliable stream: nothing is lost on it
+	link          float64 // the current road is an application's slow link: its rate to plan with, bytes/s
 	bw            float64
 	bwAt          time.Time
 
@@ -148,6 +154,9 @@ func (s *stream) rate(now time.Time, r float64) {
 // its minimum). Without a queue the rate samples may come from small messages that never
 // filled the link, so they must not hold it back.
 func (s *stream) canSend() bool {
+	if s.link > 0 && s.inflightBytes >= int64(s.linkRate()*linkQueue.Seconds())+maxPart {
+		return false // an application road (Bluetooth): about a second of the link in flight
+	}
 	if s.reliable { // the road (TCP, a relay over TLS) controls congestion itself
 		return len(s.inflight) < cwndMax
 	}
@@ -166,7 +175,14 @@ func (s *stream) canSend() bool {
 // parts sent ahead of it, doubled for every retry.
 func (s *stream) timeout(p *part, ahead int) time.Duration {
 	t := s.rto()
-	if s.bw > 0 {
+	if s.link > 0 {
+		// a slow application road: the part itself takes link time too (tens of milliseconds,
+		// more than a round trip of small packets shows), its packet and framing count, and a
+		// lone part's ack may wait ackDelay. Twice that: the rate is a maximum of samples that
+		// acks arriving in bunches inflate, and a timer that fires on the link's queue sends
+		// the part again behind it, while a late one costs little where nothing is lost
+		t += ackDelay + 2*time.Duration(float64(ahead+1)*float64(maxPart+64)/s.linkRate()*float64(time.Second))
+	} else if s.bw > 0 {
 		t += time.Duration(float64(ahead*maxPart) / s.bw * float64(time.Second))
 	}
 	// back off only on signs of congestion, or after three tries in a row: a random loss
@@ -179,6 +195,15 @@ func (s *stream) timeout(p *part, ahead int) time.Duration {
 		t *= 2
 	}
 	return min(t, rtoMax)
+}
+
+// linkRate is the rate the link delivers at: as measured, else what an application road
+// declares (0 — unknown).
+func (s *stream) linkRate() float64 {
+	if s.bw > 0 {
+		return s.bw
+	}
+	return s.link
 }
 
 // sample takes a round-trip measurement (only from parts sent once — Karn's rule). A round
@@ -345,6 +370,7 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 		b = append(b, p.data...)
 		p.copies = append(p.copies, now)
 		p.delivered = s.delivered
+		p.busy = s.inflightBytes-int64(len(p.data)) >= 2*maxPart
 		p.sent = now
 		p.tries++
 	}
@@ -426,6 +452,12 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 					}
 				}
 				s.sample(now.Sub(sent))
+			} else if p.tries > 1 && s.reliable && s.link > 0 {
+				// an application stream road loses nothing and keeps order: the first copy
+				// arrived first, and this ack is for it — a round-trip sample, so the timer
+				// catches up with the link (if it went on a road that lost it, the sample is
+				// only too long)
+				s.sample(now.Sub(p.copies[0]))
 			}
 			if sent.After(newest) {
 				newest = sent
@@ -433,7 +465,10 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 			s.delivered += int64(len(p.data))
 			if p.tries == 1 {
 				s.sample(now.Sub(p.sent))
-				if dt := now.Sub(p.sent); dt > 0 {
+				// on an application road only a part sent behind others measures the link: a lone
+				// one comes back in a round trip that says nothing of its rate (on a link with no
+				// latency it would claim many times the rate)
+				if dt := now.Sub(p.sent); dt > 0 && (s.link == 0 || p.busy) {
 					s.rate(now, float64(s.delivered-p.delivered)/dt.Seconds())
 				}
 			}
@@ -482,10 +517,13 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 		}
 		// fast retransmit, as TCP after three duplicate acks: three parts after the gap arrived,
 		// so the gap is lost — resend it now instead of waiting for the timer. Fewer than
-		// three may be reordering: wait a quarter of a round trip.
+		// three may be reordering: wait a quarter of a round trip. On an application road a
+		// copy already resent waits behind the link's queue: the acks that keep showing the
+		// gap meanwhile do not mean it is lost again, so it goes again only a round trip later
 		if beyond > 0 && !s.reliable {
 			if p := s.inflight[uint32(upto+1)]; p != nil &&
-				(beyond >= 3 || now.Sub(p.sent) >= max(s.srtt/4, ackDelay)) {
+				(beyond >= 3 || now.Sub(p.sent) >= max(s.srtt/4, ackDelay)) &&
+				(s.link == 0 || p.tries == 1 || now.Sub(p.sent) >= s.srtt) {
 				p.sent = time.Time{}
 			}
 		}

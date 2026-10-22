@@ -46,18 +46,36 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
   turns that off, `DictState` tells what compresses messages to a device now.
 - `Befriend` — add a device known from the family book without pairing.
 - `SetRelay` — your relay for when devices cannot reach each other directly.
+- `AttachRoad` — a road your app provides: Bluetooth LE GATT, a serial line, a pipe (spec §3).
+  The app implements `Send` and hands what arrives to `Receive`:
+
+  ```go
+  // GATT: ordered and acknowledged, writes of ATT MTU − 3 bytes — a stream road
+  ble, _ := node.AttachRoad(peer.Addr, gattLink, p2pact.AppRoadConfig{
+  	Name: "ble", Stream: true, MTU: mtu - 3, Rate: 40 << 10})
+  // in the GATT callbacks (characteristic written, notification received):
+  ble.Receive(value)
+  // the link dropped:
+  ble.Detach()
+  ```
+
+  `peer` is the device the link reaches if the app knows it (from its advertisement); `""`
+  — learnt from the first handshake on it, and offered to `Join` for pairing. The road is used
+  while nothing better is up; the session moves to UDP, TCP or a relay as soon as one answers
+  and comes back when they fall silent.
 
 ## What is implemented
 
 - Pairing by invite (Noise XXpsk2), sessions with data in the first packet (Noise IK).
-- Roads: UDP, TCP, relay. A session moves between roads without a new handshake.
+- Roads: UDP, TCP, relay, and roads the app provides (datagram or stream: Bluetooth LE). A
+  session moves between roads without a new handshake.
 - Delivery: streams, ack ranges, congestion control (a window that grows while no queue
   builds, timers from the measured round trip, a delivery-rate limit), retransmission over
   the next live road, long messages in parts.
 - Compression: zstd with the common dictionary and dictionaries each device trains for each
   device it talks to (fastCover, as `zstd --train`, with the parameters picked on held-out
   messages).
-- Not yet: the family tool, Bluetooth, NAT hole punching.
+- Not yet: the family tool, NAT hole punching.
 
 ## Relay
 

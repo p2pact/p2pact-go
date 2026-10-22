@@ -25,6 +25,10 @@ const (
 	sessionIdle  = 3 * time.Minute
 )
 
+// probeEvery is how often the direct roads are tried while a session runs over a relay or an
+// application road (spec §7); tests shorten it.
+var probeEvery = 30 * time.Second
+
 // Handler is a tool method: arguments → result (or *Error).
 type Handler func(peer string, args []cbor.RawMessage) ([]any, error)
 
@@ -87,19 +91,21 @@ type peerState struct {
 	boot     uint32 // the other device's boot id (from the handshake)
 	heard    bool   // it knows our boot id: sent us session data or answered our handshake
 	lastInit time.Time
-	calls    map[uint64]chan callResult
-	callID   uint64
-	dicts    [][]byte  // its dictionaries (ids), newest first — from its hello and 0.5
-	lacks    [][]byte  // it asked us for these, so it lacks them until it announces again
-	waiting  []inbound // waiting for a dictionary (spec §5): run in order once it arrives
-	fetching bool
-	tried    [][]byte        // dictionaries of its list we asked it for and did not get
-	hist     *history        // what we sent it and got from it, to train our dictionary for it
-	sysCalls map[uint64]bool // our calls of tool 0: their results are not conversation
-	queue    []pending       // conversation messages waiting to be learnt (learn.go)
-	queued   int
-	lastTalk time.Time
-	inbox    map[uint64]*inbox // calls and events waiting for their turn, per stream
+	// the direct roads were last tried while the session ran over a relay or an application road
+	lastProbe time.Time
+	calls     map[uint64]chan callResult
+	callID    uint64
+	dicts     [][]byte  // its dictionaries (ids), newest first — from its hello and 0.5
+	lacks     [][]byte  // it asked us for these, so it lacks them until it announces again
+	waiting   []inbound // waiting for a dictionary (spec §5): run in order once it arrives
+	fetching  bool
+	tried     [][]byte        // dictionaries of its list we asked it for and did not get
+	hist      *history        // what we sent it and got from it, to train our dictionary for it
+	sysCalls  map[uint64]bool // our calls of tool 0: their results are not conversation
+	queue     []pending       // conversation messages waiting to be learnt (learn.go)
+	queued    int
+	lastTalk  time.Time
+	inbox     map[uint64]*inbox // calls and events waiting for their turn, per stream
 }
 
 type inbound struct {
@@ -140,7 +146,8 @@ type Node struct {
 	udp  *UDPRoad
 	tcp  *TCPRoad
 	own  *RelayHint
-	rel  map[string]*RelayRoad // by server address
+	rel  map[string]*RelayRoad  // by server address
+	apps map[*AttachedRoad]bool // roads the application provides (approad.go)
 
 	sessions map[uint32]*session // by our index
 	current  map[string]*session // the best session with a device
@@ -166,7 +173,7 @@ func NewNode(dir, name string) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, dir: dir, boot: binary.BigEndian.Uint32(randBytes(4)),
-		rel: map[string]*RelayRoad{}, sessions: map[uint32]*session{}, current: map[string]*session{},
+		rel: map[string]*RelayRoad{}, apps: map[*AttachedRoad]bool{}, sessions: map[uint32]*session{}, current: map[string]*session{},
 		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, peers: map[string]*peerState{},
 		handlers: map[[2]int]Handler{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
 		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
@@ -293,7 +300,14 @@ func (n *Node) Close() {
 	for _, r := range n.rel {
 		r.close()
 	}
+	var apps []*AttachedRoad
+	for a := range n.apps {
+		apps = append(apps, a)
+	}
 	n.mu.Unlock()
+	for _, a := range apps {
+		a.Detach()
+	}
 	n.wg.Wait()
 }
 
@@ -339,6 +353,11 @@ func (n *Node) Join(ctx context.Context, inv *Invite) (Peer, error) {
 		r.join(hexs(inv.ID()), "b")
 		defer r.leave(hexs(inv.ID()))
 		eps = append(eps, Endpoint{Road: r, Addr: hexs(inv.ID())})
+	}
+	for a := range n.apps { // a link the application opened to a device it has not named
+		if a.peer == "" || a.peer == addr {
+			eps = append(eps, Endpoint{Road: a, Addr: a.id})
+		}
 	}
 	n.mu.Unlock()
 	if len(eps) == 0 {
@@ -641,7 +660,16 @@ func (n *Node) onDataLocked(now time.Time, pkt []byte, from Endpoint) {
 	}
 	ps := n.peerLocked(s.peer)
 	ps.heard = true
+	// a packet on a better road than the one in use (a probe, spec §7) is answered on it: the
+	// other side hears the road too, and both move to it
+	better := false
+	if c := n.candidatesLocked(s.peer, ps, now, false); len(c) == 1 && roadRank(from.Road) < roadRank(c[0].ep.Road) {
+		better = true
+	}
 	n.seenLocked(ps, from, now, s.local)
+	if better {
+		n.sealToLocked(s, ps.eps[from.key()], now, keepalive())
+	}
 	_ = ps.st.receive(now, plain, func(msg []byte, zip bool, st uint64) { n.inboundLocked(s.peer, msg, zip, st) })
 	if !ps.st.ackDue.IsZero() && !now.Before(ps.st.ackDue) {
 		n.wakeLocked() // an ack is due now
@@ -1053,15 +1081,6 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 		}
 	}
 	if len(alive) > 0 && !all {
-		rank := func(e *epState) int { // UDP, then TCP, then relay
-			switch e.ep.Road.Name() {
-			case "udp":
-				return 0
-			case "tcp":
-				return 1
-			}
-			return 2
-		}
 		// the road heard from last: a device that reconnected (a new TCP connection, a new
 		// port behind NAT, UDP blocked so it moved to TCP) leaves its old endpoint "alive"
 		// for a while, but it is dead. A better kind of road wins only if it was heard from
@@ -1073,7 +1092,7 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 			}
 		}
 		for _, e := range alive {
-			if rank(e) < rank(best) && best.lastRecv.Sub(e.lastRecv) < 500*time.Millisecond {
+			if roadRank(e.ep.Road) < roadRank(best.ep.Road) && best.lastRecv.Sub(e.lastRecv) < 500*time.Millisecond {
 				best = e
 			}
 		}
@@ -1109,7 +1128,27 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 	if r := n.pairRelayLocked(p); r != nil {
 		add(Endpoint{Road: r, Addr: p.relayChannel()})
 	}
+	for a := range n.apps { // a road the application opened to this device
+		if a.peer == peer {
+			add(Endpoint{Road: a, Addr: a.id})
+		}
+	}
 	return out
+}
+
+// roadRank orders kinds of roads (spec §7): UDP, then TCP, then a relay, then a road the
+// application provides (a slow local link: Bluetooth).
+func roadRank(r Road) int {
+	if _, ok := r.(*AttachedRoad); ok {
+		return 3
+	}
+	switch r.Name() {
+	case "udp":
+		return 0
+	case "tcp":
+		return 1
+	}
+	return 2
 }
 
 // pairRelayLocked picks the pair's relay: the one of the lower address, else the other's.
@@ -1211,7 +1250,10 @@ func (n *Node) pumpLocked(now time.Time) {
 			continue
 		}
 		if c := n.candidatesLocked(peer, ps, now, false); len(c) == 1 {
-			ps.st.reliable = c[0].ep.Road.Name() != "udp"
+			ps.st.reliable, ps.st.link = c[0].ep.Road.Name() != "udp", 0
+			if a, ok := c[0].ep.Road.(*AttachedRoad); ok {
+				ps.st.reliable, ps.st.link = a.cfg.Stream, a.rate()
+			}
 		}
 		for i := 0; ; i++ {
 			if i == 256 { // a burst at a time; the rest on the next wake
@@ -1233,6 +1275,25 @@ func (n *Node) pumpLocked(now time.Time) {
 					e.lastSend = now
 				}
 			}
+		}
+	}
+}
+
+// probeLocked tries the direct roads to a device while the session runs over a relay or a
+// road the application provides (spec §7): a keepalive to every UDP and TCP address known
+// for it, every probeEvery. The one that answers is live, and being better it takes over.
+func (n *Node) probeLocked(now time.Time, peer string, ps *peerState, s *session) {
+	if now.Sub(ps.lastProbe) < probeEvery {
+		return
+	}
+	c := n.candidatesLocked(peer, ps, now, false)
+	if len(c) != 1 || roadRank(c[0].ep.Road) < 2 {
+		return
+	}
+	ps.lastProbe = now
+	for _, e := range n.candidatesLocked(peer, ps, now, true) {
+		if roadRank(e.ep.Road) < 2 {
+			n.sealToLocked(s, e, now, keepalive())
 		}
 	}
 }
@@ -1272,6 +1333,9 @@ func (n *Node) maintainLocked(now time.Time) {
 		s := n.current[p.Addr]
 		if s == nil && now.Sub(ps.lastInit) >= autoConnect {
 			n.startInitLocked(now, p.Addr, ps, nil)
+		}
+		if s != nil {
+			n.probeLocked(now, p.Addr, ps, s)
 		}
 	}
 	for idx, s := range n.sessions {

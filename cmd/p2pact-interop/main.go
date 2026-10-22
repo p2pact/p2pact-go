@@ -8,6 +8,11 @@
 //	{"cmd":"known","peer":"…"}                                → {"known":true|false}
 //	{"cmd":"call","peer":"…","data":"<base64>","stream":N}    → {"data":"<base64>"}  (echo, tool 64 method 1; stream optional)
 //	{"cmd":"dict","raw":"<base64>"}                           → {"ok":true}
+//	{"cmd":"road","listen":"127.0.0.1:0","mtu":20,"rate":N}   → {"road":"127.0.0.1:…"}
+//	{"cmd":"road","dial":"127.0.0.1:…","mtu":20,"rate":N,"peer":"…"} → {"ok":true}
+//	  an application road (stream) over a local TCP connection that stands in for a Bluetooth
+//	  LE link: writes of at most mtu bytes, paced to rate bytes a second (0 — not paced); the
+//	  listening side attaches the first connection it accepts; peer optional (bound road)
 //	{"cmd":"close"}
 //
 // Errors: {"error":"…"}. Usage: p2pact-interop [data dir] [name]
@@ -17,6 +22,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"time"
 
@@ -60,6 +66,8 @@ func main() {
 			TCP                    *string
 			Data, Raw              []byte
 			Stream                 uint64
+			Listen, Dial           string
+			MTU, Rate              int
 		}
 		if json.Unmarshal(in.Bytes(), &req) != nil {
 			say(map[string]string{"error": "bad json"})
@@ -125,6 +133,34 @@ func main() {
 				continue
 			}
 			say(map[string]bool{"ok": true})
+		case "road":
+			cfg := p2pact.AppRoadConfig{Name: "ble", Stream: true, MTU: req.MTU, Rate: req.Rate}
+			if req.Listen != "" {
+				ln, err := net.Listen("tcp", req.Listen)
+				if err != nil {
+					fail(err)
+					continue
+				}
+				go func() {
+					c, err := ln.Accept()
+					ln.Close()
+					if err == nil {
+						linkRoad(n, c, "", cfg)
+					}
+				}()
+				say(map[string]string{"road": ln.Addr().String()})
+				continue
+			}
+			c, err := net.Dial("tcp", req.Dial)
+			if err != nil {
+				fail(err)
+				continue
+			}
+			if err := linkRoad(n, c, req.Peer, cfg); err != nil {
+				fail(err)
+				continue
+			}
+			say(map[string]bool{"ok": true})
 		case "close":
 			n.Close()
 			return
@@ -133,4 +169,53 @@ func main() {
 		}
 	}
 	n.Close()
+}
+
+// pipeLink is a Bluetooth LE link stood in for by a TCP connection: Send writes at most MTU
+// bytes at a time, at the link's rate.
+type pipeLink struct {
+	c    net.Conn
+	rate int
+	free time.Time
+}
+
+func (l *pipeLink) Send(b []byte) error {
+	if l.rate > 0 {
+		now := time.Now()
+		if l.free.Before(now.Add(-10 * time.Millisecond)) { // idle: the link starts now (an oversleep does not slow it)
+			l.free = now
+		}
+		l.free = l.free.Add(time.Duration(len(b)) * time.Second / time.Duration(l.rate))
+		if d := time.Until(l.free); d > 2*time.Millisecond {
+			time.Sleep(d)
+		}
+	}
+	_, err := l.c.Write(b)
+	return err
+}
+
+// linkRoad attaches a connection as an application road and feeds it what arrives, in pieces of
+// at most MTU bytes, as GATT delivers them.
+func linkRoad(n *p2pact.Node, c net.Conn, peer string, cfg p2pact.AppRoadConfig) error {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	r, err := n.AttachRoad(peer, &pipeLink{c: c, rate: cfg.Rate}, cfg)
+	if err != nil {
+		c.Close()
+		return err
+	}
+	go func() {
+		defer r.Detach()
+		defer c.Close()
+		buf := make([]byte, cfg.MTU)
+		for {
+			k, err := c.Read(buf)
+			if err != nil {
+				return
+			}
+			r.Receive(buf[:k])
+		}
+	}()
+	return nil
 }
