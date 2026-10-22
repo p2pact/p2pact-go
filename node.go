@@ -85,6 +85,7 @@ type peerState struct {
 	eps      map[string]*epState
 	lastTS   uint64 // timestamp of the last accepted handshake start
 	boot     uint32 // the other device's boot id (from the handshake)
+	heard    bool   // it knows our boot id: sent us session data or answered our handshake
 	lastInit time.Time
 	calls    map[uint64]chan callResult
 	callID   uint64
@@ -639,6 +640,7 @@ func (n *Node) onDataLocked(now time.Time, pkt []byte, from Endpoint) {
 		n.current[s.peer] = s
 	}
 	ps := n.peerLocked(s.peer)
+	ps.heard = true
 	n.seenLocked(ps, from, now, s.local)
 	_ = ps.st.receive(now, plain, func(msg []byte, zip bool, st uint64) { n.inboundLocked(s.peer, msg, zip, st) })
 	if !ps.st.ackDue.IsZero() && !now.Before(ps.st.ackDue) {
@@ -681,7 +683,10 @@ func (n *Node) onInitLocked(now time.Time, pkt []byte, from Endpoint) {
 	n.bootLocked(ps, binary.BigEndian.Uint32(payload[8:12]))
 	out := put32(put32([]byte{pResp}, s.remote), local)
 	_ = from.Road.Send(from.Addr, append(out, resp...))
-	if len(payload) > 12 { // data in the first packet
+	// data in the first packet; from a device that has not heard our boot id it may be
+	// numbered for our previous boot, to be renumbered once it gets our reply: drop it
+	// unacknowledged, it comes again in the session
+	if len(payload) > 12 && ps.heard {
 		_ = ps.st.receive(now, payload[12:], func(msg []byte, zip bool, st uint64) { n.inboundLocked(peer, msg, zip, st) })
 	}
 	n.sendInfoLocked(peer)
@@ -706,6 +711,7 @@ func (n *Node) onRespLocked(now time.Time, pkt []byte, from Endpoint) {
 	n.current[h.peer] = s
 	n.handshakes.Add(1)
 	ps := n.peerLocked(h.peer)
+	ps.heard = true
 	n.seenLocked(ps, from, now, s.local)
 	n.bootLocked(ps, binary.BigEndian.Uint32(payload[:4]))
 	n.sendInfoLocked(h.peer)

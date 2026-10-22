@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"math/big"
 	mrand "math/rand"
 	"net"
@@ -325,6 +326,86 @@ func TestStreamOrderOfEvents(t *testing.T) {
 	for i := 1; i < total; i++ {
 		if got[i-1] != i {
 			t.Fatalf("out of order at %d: %v", i, got[:i])
+		}
+	}
+}
+
+// The other device restarts silently while our calls are in flight: we handshake again with
+// a part in the first packet, numbered for its old boot; its reply renumbers everything
+// (spec §4.2). Every call must still run exactly once, and later calls must not be lost.
+func TestRestartWithPartsInFlight(t *testing.T) {
+	dir := t.TempDir()
+	a, b := node(t, "Mac", true, nil), nodeIn(t, dir, "Phone", true, nil)
+	defer a.Close()
+	pair(t, a, b)
+	for i := 0; i < 10; i++ { // the numbering moves on
+		echo(t, a, b, []byte("before"), 5*time.Second)
+	}
+	baddr := b.udp.conn.LocalAddr().String()
+	b.UDP().SetDrop(func() bool { return true }) // the calls below never reach the old boot
+	var mu sync.Mutex
+	runs := map[string]int{}
+	count := func(n *Node) {
+		n.Handle(64, 3, func(_ string, args []cbor.RawMessage) ([]any, error) {
+			var s string
+			_ = cbor.Unmarshal(args[0], &s)
+			mu.Lock()
+			runs[s]++
+			mu.Unlock()
+			return []any{s}, nil
+		})
+	}
+	call := func(s string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		res, err := a.Call(ctx, b.ID.Addr(), 64, 3, s)
+		var got string
+		if err == nil && (len(res) != 1 || cbor.Unmarshal(res[0], &got) != nil || got != s) {
+			err = fmt.Errorf("%q answered %q", s, got)
+		}
+		return err
+	}
+	errs := make(chan error, 3)
+	for _, s := range []string{"lost 1", "lost 2", "lost 3"} {
+		go func() { errs <- call(s) }()
+	}
+	time.Sleep(300 * time.Millisecond)
+	b.Close()
+	b2, err := NewNode(dir, "Phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count(b2)
+	if err := b2.ListenUDP(baddr); err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Close()
+	// we notice first (the new boot only answers handshakes before Start): the session is
+	// gone and the lost calls are due, so the first one rides in the handshake's first packet
+	a.mu.Lock()
+	delete(a.current, b.ID.Addr())
+	for _, p := range a.peers[b.ID.Addr()].st.inflight {
+		p.sent = time.Time{}
+	}
+	a.wakeLocked()
+	a.mu.Unlock()
+	time.Sleep(300 * time.Millisecond)
+	b2.Start()
+	for i := 0; i < 3; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		if err := call(fmt.Sprintf("after %d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for s, n := range runs {
+		if n != 1 {
+			t.Errorf("%q ran %d times", s, n)
 		}
 	}
 }
