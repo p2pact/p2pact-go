@@ -478,3 +478,22 @@ func TestAnswerLater(t *testing.T) {
 		t.Fatal("the answer given later did not arrive")
 	}
 }
+
+// Our addresses changed (another network): the device in session learns them from our hello
+// at once, without a new handshake.
+func TestReannounceOnNewAddress(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	echo(t, a, b, []byte("hi"), 5*time.Second)
+	a.SetAdvertise(&Hints{UDP: []string{"10.238.250.33:48740"}})
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if p := b.Trust.Get(a.ID.Addr()); p != nil && len(p.Hints.UDP) == 1 && p.Hints.UDP[0] == "10.238.250.33:48740" {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("b did not learn a's new address")
+}

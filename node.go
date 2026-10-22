@@ -163,7 +163,10 @@ type Node struct {
 	// NoLearning: do not train our own dictionaries on what we send (spec §5).
 	NoLearning bool
 
-	advertise *Hints // announced instead of our own addresses (SetAdvertise)
+	advertise *Hints
+	// hintsSent: our addresses as last announced; hintsAt: when last checked (reannounceLocked)
+	hintsSent []byte
+	hintsAt   time.Time // announced instead of our own addresses (SetAdvertise)
 	// AllowDict decides whether a known device may fetch a dictionary (0.5); nil — all may.
 	AllowDict func(peer string, id []byte) bool
 
@@ -663,6 +666,23 @@ func (n *Node) SetAdvertise(h *Hints) {
 	n.mu.Unlock()
 }
 
+// reannounceLocked: our addresses changed (another network, an advertised address) — tell the
+// devices in session at once with our hello, not at the next handshake: after a network switch
+// they would keep trying the old address until a relay or a restart brought them together.
+func (n *Node) reannounceLocked(now time.Time) {
+	if now.Sub(n.hintsAt) < 5*time.Second {
+		return
+	}
+	n.hintsAt = now
+	cur, _ := cbor.Marshal(toWire(n.hintsLocked()))
+	if n.hintsSent == nil || bytes.Equal(cur, n.hintsSent) {
+		return // nothing announced yet, or the same
+	}
+	for peer := range n.current {
+		n.sendInfoLocked(peer)
+	}
+}
+
 func (n *Node) hintsLocked() Hints {
 	if n.advertise != nil {
 		h := *n.advertise
@@ -969,6 +989,7 @@ func (n *Node) bootLocked(ps *peerState, boot uint32) {
 
 // sendInfoLocked sends our hello: name and where to find us (event 0.2).
 func (n *Node) sendInfoLocked(peer string) {
+	n.hintsSent, _ = cbor.Marshal(toWire(n.hintsLocked())) // what the devices know of us (reannounceLocked)
 	msg, _ := cbor.Marshal(append([]any{3, 0, 2}, n.infoLocked(peer)...))
 	n.pushLocked(n.peerLocked(peer), msg, 0, false, false)
 }
@@ -1452,6 +1473,7 @@ func (n *Node) maintainLocked(now time.Time) {
 		}
 	}
 	n.unholdLocked(now)
+	n.reannounceLocked(now)
 	for idx, s := range n.sessions {
 		if n.current[s.peer] != s && now.Sub(s.lastRecv) > sessionIdle {
 			delete(n.sessions, idx)
