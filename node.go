@@ -88,6 +88,8 @@ type handshake struct {
 	early []earlyPacket
 	// pairing, we respond: the joiner's index from its first packet
 	remoteIdx uint32
+	// pairing, we join: what we ask to use on the inviting device (spec §2)
+	wants []Grant
 }
 
 type earlyPacket struct {
@@ -154,6 +156,12 @@ type Node struct {
 	OnEvent func(peer string, tool, event int, args []cbor.RawMessage)
 	// OnPaired is called after pairing (on either side).
 	OnPaired func(p Peer)
+	// OnWants is called on the inviting device when a newcomer has paired (spec §2), with what it
+	// asks to use (everything, if it did not say): the application shows it to its person and
+	// returns what the newcomer is granted, or false to refuse (the newcomer is forgotten). It
+	// runs on its own goroutine and may wait for the person; the newcomer can use nothing
+	// meanwhile. OnPaired follows when it accepts. nil — the newcomer gets what it asked for.
+	OnWants func(p Peer, wants []Grant) (grants []Grant, ok bool)
 	// OnGranted is called when a known device tells what we may use of its tools (event 0.6).
 	OnGranted func(peer string, grants []Grant)
 	// OnHello is called when a known device sends its hello (new session or pairing).
@@ -437,6 +445,14 @@ func (n *Node) Invite(ttl time.Duration) *Invite {
 
 // Join pairs using an invite, trying all its hints until one answers.
 func (n *Node) Join(ctx context.Context, inv *Invite) (Peer, error) {
+	return n.JoinWants(ctx, inv, nil)
+}
+
+// JoinWants is Join asking for permissions (spec §2, `wants`): what we want to use on the
+// inviting device. Its person may narrow it; the result comes back as event 0.6
+// ([Node.GrantedBy], OnGranted). nil — we ask for everything, as between one person's own
+// devices.
+func (n *Node) JoinWants(ctx context.Context, inv *Invite, wants []Grant) (Peer, error) {
 	addr := Address(inv.Key)
 	var eps []Endpoint
 	n.mu.Lock()
@@ -480,7 +496,7 @@ func (n *Node) Join(ctx context.Context, inv *Invite) (Peer, error) {
 		}
 		msg1, _, _, _ := hs.WriteMessage(nil, nil)
 		local = n.newIndexLocked()
-		n.hs[local] = &handshake{pair: true, hs: hs, invite: inv, done: done, at: time.Now()}
+		n.hs[local] = &handshake{pair: true, hs: hs, invite: inv, done: done, at: time.Now(), wants: wants}
 		pkt := append([]byte{pPair1}, inv.ID()...)
 		pkt = append(put32(pkt, local), msg1...)
 		if !n.paused { // paused: try again on the next tick
@@ -523,12 +539,14 @@ const (
 // the last two are optional and a shorter one (an older device) leaves them zero; more elements
 // than we know are ignored.
 type pairInfo struct {
-	Name    string
-	Boot    uint32
-	Hints   hintsWire
-	SignKey []byte
-	OS      string
-	Kind    int
+	Name     string
+	Boot     uint32
+	Hints    hintsWire
+	SignKey  []byte
+	OS       string
+	Kind     int
+	Wants    []Grant
+	HasWants bool // the newcomer asked for something (spec §2); otherwise it asks for everything
 }
 
 func parsePair(b []byte) pairInfo {
@@ -542,13 +560,21 @@ func parsePair(b []byte) pairInfo {
 			_ = cbor.Unmarshal(a[i], v)
 		}
 	}
+	if len(a) > 6 {
+		p.Wants, p.HasWants = parseGrants(a[6])
+	}
 	return p
 }
 
-func (n *Node) pairPayloadLocked() []byte {
+// pairPayloadLocked is our payload; wants are what we ask to use (nil — not asking, the field
+// is left out and so is the kind if we do not say one: an older device gets what it knows).
+func (n *Node) pairPayloadLocked(wants []Grant) []byte {
 	a := []any{n.Name, n.boot, toWire(n.hintsLocked()), n.ID.SignPublic(), runtime.GOOS}
-	if n.Kind != KindUnknown {
+	if n.Kind != KindUnknown || wants != nil {
 		a = append(a, n.Kind)
+	}
+	if wants != nil {
+		a = append(a, grantsWire(cleanGrants(wants)))
 	}
 	b, _ := cbor.Marshal(a)
 	return b
@@ -932,7 +958,7 @@ func (n *Node) onPair1Locked(now time.Time, pkt []byte, from Endpoint) {
 	if _, _, _, err := hs.ReadMessage(nil, pkt[21:]); err != nil {
 		return
 	}
-	msg2, _, _, err := hs.WriteMessage(nil, n.pairPayloadLocked())
+	msg2, _, _, err := hs.WriteMessage(nil, n.pairPayloadLocked(nil))
 	if err != nil {
 		return
 	}
@@ -962,7 +988,7 @@ func (n *Node) onPair2Locked(now time.Time, pkt []byte, from Endpoint) {
 		return
 	}
 	pp := parsePair(payload)
-	msg3, cs1, cs2, err := h.hs.WriteMessage(nil, n.pairPayloadLocked())
+	msg3, cs1, cs2, err := h.hs.WriteMessage(nil, n.pairPayloadLocked(h.wants))
 	if err != nil || cs1 == nil {
 		return
 	}
@@ -1012,6 +1038,17 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	pp := parsePair(payload)
 	p := Peer{Addr: peer, Key: append([]byte(nil), key...), Name: pp.Name, PairSecret: h.invite.Secret, Hints: fromWire(pp.Hints),
 		SignKey: pp.SignKey, OS: pp.OS, Kind: pp.Kind, Via: hexs(h.invite.ID())}
+	// what the newcomer may use (spec §2): without wants it asks for everything and keeps the
+	// default; with them, and no OnWants to narrow them, it gets what it asked. With OnWants
+	// the application decides: until it does the newcomer may use nothing.
+	ask := false
+	if pp.HasWants {
+		p.Grants = cleanGrants(pp.Wants)
+	}
+	if n.OnWants != nil {
+		ask = true
+		p.Grants = []Grant{}
+	}
 	n.Trust.Put(p)
 	// the joiner was the initiator; we are the responder
 	s := &session{peer: peer, local: local, remote: h.remoteIdx, send: cs2.Cipher(), recv: cs1.Cipher(), lastRecv: now}
@@ -1020,6 +1057,26 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	ps := n.peerLocked(peer)
 	n.seenLocked(ps, from, now, s.local)
 	n.bootLocked(ps, pp.Boot)
+	if ask {
+		wants := pp.Wants
+		if !pp.HasWants {
+			wants = DefaultGrants()
+		}
+		on := n.OnWants
+		n.sendInfoLocked(peer)
+		n.goLocked(func() {
+			grants, ok := on(p, cleanGrants(wants))
+			if !ok {
+				n.Forget(peer)
+				return
+			}
+			_ = n.SetGrants(peer, grants)
+			if n.OnPaired != nil {
+				n.OnPaired(*n.Trust.Get(peer))
+			}
+		})
+		return
+	}
 	n.pairedLocked(p)
 }
 

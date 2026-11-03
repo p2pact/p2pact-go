@@ -63,7 +63,7 @@ func TestKindOldPeer(t *testing.T) {
 	// a node that does not say its kind sends the old payload
 	var pl []cbor.RawMessage
 	a.mu.Lock()
-	b2 := a.pairPayloadLocked()
+	b2 := a.pairPayloadLocked(nil)
 	a.mu.Unlock()
 	if cbor.Unmarshal(b2, &pl) != nil || len(pl) != 5 {
 		t.Fatalf("a device with no kind sends %d fields", len(pl))
