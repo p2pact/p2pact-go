@@ -17,6 +17,9 @@
 //	  an application road (stream) over a local TCP connection that stands in for a Bluetooth
 //	  LE link: writes of at most mtu bytes, paced to rate bytes a second (0 — not paced); the
 //	  listening side attaches the first connection it accepts; peer optional (bound road)
+//	{"cmd":"relay","addr":"host:port","fp":"hex","ws":["wss://…"]} → {"ok":true}
+//	  uses a relay (TLS address and certificate fingerprint) and tells its WebSocket URLs in
+//	  the hints, so a browser can pair by our invite; say it before "invite"
 //	{"cmd":"close"}
 //
 // Kinds, named tools, grants, wants, the local socket and hosted tools (spec §1, §2, §8):
@@ -178,6 +181,8 @@ func main() {
 			Kind, Level, Method     int
 			Event                   int
 			Name, Tool, Use, Plugin string
+			Addr, FP                string
+			WS                      []string
 			Wants, Grants           [][]any
 		}
 		if json.Unmarshal(in.Bytes(), &req) != nil {
@@ -278,6 +283,10 @@ func main() {
 				fail(err)
 				continue
 			}
+			say(map[string]bool{"ok": true})
+		case "relay":
+			n.SetRelay(p2pact.RelayHint{Addr: req.Addr, FP: req.FP})
+			n.SetRelayWS(req.WS...)
 			say(map[string]bool{"ok": true})
 		case "road":
 			cfg := p2pact.AppRoadConfig{Name: "ble", Stream: true, MTU: req.MTU, Rate: req.Rate}

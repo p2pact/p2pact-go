@@ -65,3 +65,15 @@ func TestAppRoadRank(t *testing.T) {
 		t.Fatalf("ranks: direct %d relay %d app %d", roadRank(direct), roadRank(relay), roadRank(plain))
 	}
 }
+
+// SetRelayWS puts the relay's WebSocket URLs into our invites and hellos.
+func TestSetRelayWS(t *testing.T) {
+	a := node(t, "Mac", false, nil)
+	defer a.Close()
+	a.SetRelay(RelayHint{Addr: "r.example:8443", FP: "ab"})
+	a.SetRelayWS("wss://r.example/")
+	inv, err := ParseInvite(a.Invite(time.Minute).String())
+	if err != nil || !reflect.DeepEqual(inv.Hints.WS, []string{"wss://r.example/"}) || inv.Hints.Relay == nil {
+		t.Fatalf("invite hints: %+v %v", inv, err)
+	}
+}

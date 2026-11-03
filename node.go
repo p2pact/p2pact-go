@@ -195,6 +195,7 @@ type Node struct {
 	// localPath: the socket we listen on, or dial
 	localPath string
 	own       *RelayHint
+	ownWS     []string               // WebSocket URLs of our relay, for the hints (SetRelayWS)
 	rel       map[string]*RelayRoad  // by server address
 	apps      map[*AttachedRoad]bool // roads the application provides (approad.go)
 	// paused: the device sleeps (SetPaused): nothing is sent, nothing is taken in
@@ -317,6 +318,14 @@ func (n *Node) UDP() *UDPRoad { return n.udp }
 func (n *Node) SetRelay(h RelayHint) {
 	n.mu.Lock()
 	n.own = &h
+	n.mu.Unlock()
+}
+
+// SetRelayWS tells the WebSocket URLs of our relay (the one given to SetRelay, as browsers
+// reach it): they go into the hints, so a browser pairing by our invite finds the same channels.
+func (n *Node) SetRelayWS(urls ...string) {
+	n.mu.Lock()
+	n.ownWS = urls
 	n.mu.Unlock()
 }
 
@@ -807,6 +816,9 @@ func (n *Node) hintsLocked() Hints {
 			cp := *n.own
 			h.Relay = &cp
 		}
+		if len(h.WS) == 0 {
+			h.WS = n.ownWS
+		}
 		return h
 	}
 	var h Hints
@@ -820,6 +832,7 @@ func (n *Node) hintsLocked() Hints {
 		cp := *n.own
 		h.Relay = &cp
 	}
+	h.WS = n.ownWS
 	return h
 }
 
