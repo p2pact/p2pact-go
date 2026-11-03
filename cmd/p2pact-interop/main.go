@@ -19,6 +19,36 @@
 //	  listening side attaches the first connection it accepts; peer optional (bound road)
 //	{"cmd":"close"}
 //
+// Kinds, named tools, grants, wants, the local socket and hosted tools (spec §1, §2, §8):
+//
+//	{"cmd":"kind","kind":N}                                   → {"ok":true}   (say it before pairing; 0 — not said)
+//	{"cmd":"peer-info","peer":"…","tool":"name"}              → {"kind":N,"tools":["…"],"number":N|null}
+//	  what we know of a device: the kind it told (pairing, hello), the named tools it announced,
+//	  and the number it gave the named tool (null — not announced)
+//	{"cmd":"tool","name":"…"}                                 → {"number":N}
+//	  registers a named tool of ours: method 1 echoes (read), 2 echoes (write), 3 answers the tool's
+//	  name (read)
+//	{"cmd":"call-tool","peer":"…","name":"…","method":N,"data":"<base64>","stream":N} → {"data":"<base64>"}
+//	  calls a tool by name; an error answer carries "code" (the call's error code, 4 — forbidden)
+//	{"cmd":"grant","peer":"…","tool":"…","level":N}           → {"ok":true}   (level 0 removes the entry)
+//	{"cmd":"set-grants","peer":"…","grants":[["tool",N]…]}      → {"ok":true}   (replaces the list; [] takes everything away)
+//	{"cmd":"grants","peer":"…"}                               → {"allowed":[["tool",N]…],"granted":[["tool",N]…]}
+//	  what we let the device use, and what it lets us use (as it told us: event 0.6)
+//	{"cmd":"emit","peer":"…","name":"…","event":N,"data":"<base64>"} → {"ok":true}
+//	  sends an event of our named tool (it goes only to a device with read on the tool)
+//	{"cmd":"events"}                                          → {"events":[{"peer":"…","tool":"name","event":N,"data":"<base64>"}]}
+//	  the events received so far (tool 0 left out)
+//	{"cmd":"on-wants","level":N}                              → {"ok":true}
+//	  from now on a newcomer is granted what it wanted, narrowed to level N at most
+//	join takes "wants":[["tool",N]…] (permissions asked for)
+//	{"cmd":"local","listen":"path"} | {"cmd":"local","use":"path"} → {"ok":true}
+//	  opens the local socket (a device) or reaches a device over its socket (a program)
+//	{"cmd":"plugin-env","grants":[["tool",N]…]}               → {"socket":"path","invite":"p2pact1.…"}
+//	  the environment for a program the device starts (P2PACT_SOCKET, P2PACT_INVITE)
+//	{"cmd":"proxy","name":"…","plugin":"…"}                   → {"ok":true}
+//	  hosts the named tool for a program paired as a plugin: one handler for all its methods
+//	  (method 2 needs write), every call is forwarded to the program's tool of that name
+//
 // Errors: {"error":"…"}. Usage: p2pact-interop [data dir] [name]
 package main
 
@@ -26,15 +56,46 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	p2pact "github.com/p2pact/p2pact-go"
 )
+
+// grantsIn reads [["tool",N]…]; grantsOut writes them back.
+func grantsIn(l [][]any) []p2pact.Grant {
+	var out []p2pact.Grant
+	for _, e := range l {
+		if len(e) == 2 {
+			t, _ := e[0].(string)
+			lv, _ := e[1].(float64)
+			out = append(out, p2pact.Grant{Tool: t, Level: int(lv)})
+		}
+	}
+	return out
+}
+
+func grantsOut(g []p2pact.Grant) [][]any {
+	out := [][]any{}
+	for _, x := range g {
+		out = append(out, []any{x.Tool, x.Level})
+	}
+	return out
+}
+
+func rawArgs(args []cbor.RawMessage) []any {
+	out := make([]any, len(args))
+	for i, a := range args {
+		out[i] = a
+	}
+	return out
+}
 
 func main() {
 	dir, name := "", "go"
@@ -89,6 +150,18 @@ func main() {
 			}
 		})
 	})
+	var evMu sync.Mutex
+	events := []map[string]any{}
+	ownTools := map[string]int{}
+	n.OnEvent = func(peer string, tool, ev int, args []cbor.RawMessage) {
+		var b []byte
+		if len(args) > 0 {
+			_ = cbor.Unmarshal(args[0], &b)
+		}
+		evMu.Lock()
+		events = append(events, map[string]any{"peer": peer, "tool": n.PeerToolName(peer, tool), "event": ev, "data": b})
+		evMu.Unlock()
+	}
 	n.Start()
 	out := json.NewEncoder(os.Stdout)
 	say := func(v any) { _ = out.Encode(v) }
@@ -96,12 +169,16 @@ func main() {
 	in.Buffer(make([]byte, 1<<20), 64<<20)
 	for in.Scan() {
 		var req struct {
-			Cmd, UDP, Invite, Peer string
-			TCP                    *string
-			Data, Raw              []byte
-			Stream                 uint64
-			Listen, Dial           string
-			MTU, Rate              int
+			Cmd, UDP, Invite, Peer  string
+			TCP                     *string
+			Data, Raw               []byte
+			Stream                  uint64
+			Listen, Dial            string
+			MTU, Rate               int
+			Kind, Level, Method     int
+			Event                   int
+			Name, Tool, Use, Plugin string
+			Wants, Grants           [][]any
 		}
 		if json.Unmarshal(in.Bytes(), &req) != nil {
 			say(map[string]string{"error": "bad json"})
@@ -139,7 +216,12 @@ func main() {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			p, err := n.Join(ctx, inv)
+			var p p2pact.Peer
+			if req.Wants != nil {
+				p, err = n.JoinWants(ctx, inv, grantsIn(req.Wants))
+			} else {
+				p, err = n.Join(ctx, inv)
+			}
 			cancel()
 			if err != nil {
 				fail(err)
@@ -221,6 +303,135 @@ func main() {
 				continue
 			}
 			if err := linkRoad(n, c, req.Peer, cfg); err != nil {
+				fail(err)
+				continue
+			}
+			say(map[string]bool{"ok": true})
+		case "kind":
+			n.Kind = req.Kind
+			say(map[string]bool{"ok": true})
+		case "peer-info":
+			r := map[string]any{"kind": 0, "tools": n.PeerTools(req.Peer), "number": nil}
+			if p := n.Trust.Get(req.Peer); p != nil {
+				r["kind"] = p.Kind
+			}
+			if req.Tool != "" {
+				if num, ok := n.ToolNumber(req.Peer, req.Tool); ok {
+					r["number"] = num
+				}
+			}
+			say(r)
+		case "tool":
+			name := req.Name
+			num, err := n.RegisterTool(name, 1)
+			if err != nil {
+				fail(err)
+				continue
+			}
+			ownTools[name] = num
+			echo := func(_ string, args []cbor.RawMessage) ([]any, error) {
+				var b []byte
+				if len(args) == 0 || cbor.Unmarshal(args[0], &b) != nil {
+					return nil, &p2pact.Error{Code: p2pact.ErrBadArgs, Text: "no data"}
+				}
+				return []any{b}, nil
+			}
+			_ = n.HandleTool(name, 1, echo)
+			_ = n.HandleTool(name, 2, echo)
+			_ = n.HandleTool(name, 3, func(string, []cbor.RawMessage) ([]any, error) { return []any{[]byte(name)}, nil })
+			n.MarkRead(num, 1, 3)
+			say(map[string]int{"number": num})
+		case "call-tool":
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			res, err := n.CallToolOn(ctx, req.Peer, req.Stream, req.Name, req.Method, req.Data)
+			cancel()
+			var b []byte
+			if err == nil && (len(res) == 0 || cbor.Unmarshal(res[0], &b) != nil) {
+				err = os.ErrInvalid
+			}
+			if err != nil {
+				e := map[string]any{"error": err.Error()}
+				var pe *p2pact.Error
+				if errors.As(err, &pe) {
+					e["code"] = pe.Code
+				}
+				say(e)
+				continue
+			}
+			say(map[string][]byte{"data": b})
+		case "grant":
+			if err := n.Grant(req.Peer, req.Tool, req.Level); err != nil {
+				fail(err)
+				continue
+			}
+			say(map[string]bool{"ok": true})
+		case "set-grants":
+			if err := n.SetGrants(req.Peer, grantsIn(req.Grants)); err != nil {
+				fail(err)
+				continue
+			}
+			say(map[string]bool{"ok": true})
+		case "grants":
+			say(map[string]any{"allowed": grantsOut(n.Grants(req.Peer)), "granted": grantsOut(n.GrantedBy(req.Peer))})
+		case "emit":
+			if err := n.Event(req.Peer, ownTools[req.Name], req.Event, req.Data); err != nil {
+				fail(err)
+				continue
+			}
+			say(map[string]bool{"ok": true})
+		case "events":
+			evMu.Lock()
+			say(map[string]any{"events": events})
+			evMu.Unlock()
+		case "on-wants":
+			max := req.Level
+			n.OnWants = func(_ p2pact.Peer, wants []p2pact.Grant) ([]p2pact.Grant, bool) {
+				var out []p2pact.Grant
+				for _, g := range wants {
+					out = append(out, p2pact.Grant{Tool: g.Tool, Level: min(g.Level, max)})
+				}
+				return out, true
+			}
+			say(map[string]bool{"ok": true})
+		case "local":
+			var err error
+			if req.Listen != "" {
+				err = n.ListenLocal(req.Listen)
+			} else {
+				err = n.UseLocal(req.Use)
+			}
+			if err != nil {
+				fail(err)
+				continue
+			}
+			say(map[string]bool{"ok": true})
+		case "plugin-env":
+			env, err := n.PluginEnv(10*time.Minute, grantsIn(req.Grants))
+			if err != nil {
+				fail(err)
+				continue
+			}
+			r := map[string]string{}
+			for _, kv := range env {
+				k, v, _ := strings.Cut(kv, "=")
+				r[map[string]string{p2pact.EnvSocket: "socket", p2pact.EnvInvite: "invite"}[k]] = v
+			}
+			say(r)
+		case "proxy":
+			name, plugin := req.Name, req.Plugin
+			err := n.HandleToolAll(name, func(_ string, level, method int, args []cbor.RawMessage) ([]any, error) {
+				if method == 2 && level < p2pact.LevelWrite {
+					return nil, &p2pact.Error{Code: p2pact.ErrForbidden, Text: "forbidden"}
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				res, err := n.CallTool(ctx, plugin, name, method, rawArgs(args)...)
+				if err != nil {
+					return nil, err
+				}
+				return rawArgs(res), nil
+			})
+			if err != nil {
 				fail(err)
 				continue
 			}
