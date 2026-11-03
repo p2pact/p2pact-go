@@ -3,6 +3,7 @@ package p2pact
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 
 	"github.com/fxamacker/cbor/v2"
@@ -179,5 +180,69 @@ func (n *Node) namedLocked() map[string][2]int {
 	for name, num := range n.names {
 		out[name] = [2]int{num, n.versions[num]}
 	}
+	return out
+}
+
+// ToolHandler is one handler for every method of a tool (see [Node.HandleToolAll]): it gets the
+// method number and the caller's level (1 or 2), and checks the level itself.
+type ToolHandler func(peer string, level, method int, args []cbor.RawMessage) ([]any, error)
+
+// HandleToolAll serves every method of the named tool with h (the tool is registered at version
+// 1 if it is not yet). The node only requires read on the tool; what each method needs is for h
+// to check. Methods registered one by one with [Node.Handle] keep their own handlers. For a
+// device that hosts another program's tool (spec §8.2).
+func (n *Node) HandleToolAll(name string, h ToolHandler) error {
+	num, err := n.RegisterTool(name, 1)
+	if err != nil {
+		return err
+	}
+	n.mu.Lock()
+	n.toolHandlers[num] = h
+	n.mu.Unlock()
+	return nil
+}
+
+// UnregisterTool takes a named tool back: it leaves the hello (sent again to the devices in
+// session) and its handlers are dropped. Registering the name again may give another number.
+func (n *Node) UnregisterTool(name string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	num, ok := n.names[name]
+	if !ok {
+		return
+	}
+	delete(n.names, name)
+	delete(n.numbers, num)
+	delete(n.versions, num)
+	delete(n.toolHandlers, num)
+	for k := range n.handlers {
+		if k[0] == num {
+			delete(n.handlers, k)
+		}
+	}
+	for k := range n.levelHandlers {
+		if k[0] == num {
+			delete(n.levelHandlers, k)
+		}
+	}
+	for k := range n.readMethods {
+		if k[0] == num {
+			delete(n.readMethods, k)
+		}
+	}
+	n.reannounceToolsLocked()
+}
+
+// PeerTools lists the named tools a device announced in its hello, sorted by name.
+func (n *Node) PeerTools(peer string) []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var out []string
+	if ps := n.peers[peer]; ps != nil {
+		for name := range ps.named {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
 	return out
 }

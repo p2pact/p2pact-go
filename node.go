@@ -207,6 +207,7 @@ type Node struct {
 	// grants (grants.go): methods that check the level themselves, methods marked read
 	levelHandlers map[[2]int]LevelHandler
 	readMethods   map[[2]int]bool
+	toolHandlers  map[int]ToolHandler // one handler for all methods of a tool (HandleToolAll)
 	// named tools (tools.go): name → number and back, versions
 	names    map[string]int
 	numbers  map[int]string
@@ -231,7 +232,7 @@ func NewNode(dir, name string) (*Node, error) {
 	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, dir: dir, boot: binary.BigEndian.Uint32(randBytes(4)),
 		rel: map[string]*RelayRoad{}, apps: map[*AttachedRoad]bool{}, sessions: map[uint32]*session{}, current: map[string]*session{},
 		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, inviteGrants: map[string][]Grant{}, peers: map[string]*peerState{},
-		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
+		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, toolHandlers: map[int]ToolHandler{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
 		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
 	n.Handle(0, 2, func(peer string, _ []cbor.RawMessage) ([]any, error) { return n.info(peer), nil })
@@ -1175,6 +1176,8 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 		}
 		if lh := n.levelHandlers[[2]int{tool, method}]; lh != nil && !forbidden {
 			h = func(peer string, args []cbor.RawMessage) ([]any, error) { return lh(peer, level, args) }
+		} else if th := n.toolHandlers[tool]; th != nil && h == nil && !forbidden {
+			h = func(peer string, args []cbor.RawMessage) ([]any, error) { return th(peer, level, method, args) }
 		}
 		args := a[4:]
 		boot := ps.boot

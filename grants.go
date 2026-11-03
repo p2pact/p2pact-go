@@ -208,7 +208,8 @@ func (n *Node) grantsEventLocked(peer string) {
 
 // requiredLevelLocked is the level a call needs.
 func (n *Node) requiredLevelLocked(tool, method int) int {
-	if n.levelHandlers[[2]int{tool, method}] != nil || n.readMethods[[2]int{tool, method}] {
+	if n.levelHandlers[[2]int{tool, method}] != nil || n.readMethods[[2]int{tool, method}] ||
+		(n.toolHandlers[tool] != nil && n.handlers[[2]int{tool, method}] == nil) {
 		return LevelRead
 	}
 	return LevelWrite

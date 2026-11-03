@@ -100,3 +100,48 @@ func TestNamedToolsOldHello(t *testing.T) {
 	}
 	echo(t, a, b, []byte("numbered"), 5*time.Second)
 }
+
+// A hosted tool: one handler for all methods, the node requires read, the handler decides the
+// rest; the tool leaves the hello when unregistered; PeerTools lists what a device announced.
+func TestHandleToolAll(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	err := a.HandleToolAll("com.acme.host", func(_ string, level, method int, _ []cbor.RawMessage) ([]any, error) {
+		if method >= 10 && level < LevelWrite {
+			return nil, &Error{Code: ErrForbidden, Text: "read only"}
+		}
+		return []any{method}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair(t, a, b)
+	eventually(t, "hello", func() bool { _, ok := b.ToolNumber(a.ID.Addr(), "com.acme.host"); return ok })
+	if got := b.PeerTools(a.ID.Addr()); len(got) != 1 || got[0] != "com.acme.host" {
+		t.Fatalf("PeerTools: %v", got)
+	}
+	if err := a.SetGrants(b.ID.Addr(), []Grant{{"com.acme.host", LevelRead}}); err != nil {
+		t.Fatal(err)
+	}
+	call := func(m int) error {
+		_, err := b.CallTool(ctx5(t), a.ID.Addr(), "com.acme.host", m)
+		return err
+	}
+	if err := call(3); err != nil {
+		t.Errorf("read method: %v", err)
+	}
+	if callCode(call(12)) != ErrForbidden {
+		t.Error("write method at read")
+	}
+	_ = a.SetGrants(b.ID.Addr(), []Grant{{"com.acme.host", LevelWrite}})
+	if err := call(12); err != nil {
+		t.Errorf("write method: %v", err)
+	}
+	_ = a.SetGrants(b.ID.Addr(), []Grant{})
+	if callCode(call(3)) != ErrForbidden {
+		t.Error("no grant")
+	}
+	a.UnregisterTool("com.acme.host")
+	eventually(t, "gone from hello", func() bool { return len(b.PeerTools(a.ID.Addr())) == 0 })
+}
