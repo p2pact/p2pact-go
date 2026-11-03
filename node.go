@@ -1158,8 +1158,8 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 
 func (n *Node) pairedLocked(p Peer) {
 	n.sendInfoLocked(p.Addr)
-	if n.OnPaired != nil {
-		go n.OnPaired(p)
+	if on := n.OnPaired; on != nil {
+		n.goLocked(func() { on(p) })
 	}
 }
 
@@ -1322,8 +1322,8 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 					}
 				}
 			}
-			if n.OnHello != nil {
-				go n.OnHello(peer)
+			if on := n.OnHello; on != nil {
+				n.goLocked(func() { on(peer) })
 			}
 			ps.dicts, ps.lacks, ps.tried = nil, nil, nil
 			_ = cbor.Unmarshal(a[7], &ps.dicts)
@@ -1334,8 +1334,8 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 		if tool == 0 && ev == 6 && len(a) >= 4 { // what we may use of its tools
 			if g, ok := parseGrants(a[3]); ok {
 				n.Trust.SetGranted(peer, g)
-				if n.OnGranted != nil {
-					go n.OnGranted(peer, g)
+				if on := n.OnGranted; on != nil {
+					n.goLocked(func() { on(peer, g) })
 				}
 			}
 			return
