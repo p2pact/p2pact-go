@@ -41,10 +41,6 @@ func GrantLevel(grants []Grant, tool string) int {
 	return level
 }
 
-func isDefaultGrants(g []Grant) bool {
-	return g == nil || (len(g) == 1 && g[0] == Grant{AllTools, LevelWrite})
-}
-
 // Allowed is what we let the device use of ours (spec §8.1); the default if never set.
 func (p Peer) Allowed() []Grant {
 	if p.Grants == nil {
@@ -196,10 +192,12 @@ func (n *Node) grantsHandler(peer string, _ []cbor.RawMessage) ([]any, error) {
 	return []any{grantsWire(n.Grants(peer))}, nil
 }
 
-// grantsEventLocked tells the device what it may use, unless that is the default it assumes.
+// grantsEventLocked tells the device what it may use, unless we never set it (the default it
+// assumes). A newcomer that asked has been granted something explicit, even ["*", 2]: it waits
+// for this event (spec §2).
 func (n *Node) grantsEventLocked(peer string) {
 	p := n.Trust.Get(peer)
-	if p == nil || isDefaultGrants(p.Grants) {
+	if p == nil || p.Grants == nil {
 		return
 	}
 	msg, _ := cbor.Marshal([]any{3, 0, 6, grantsWire(p.Grants)})

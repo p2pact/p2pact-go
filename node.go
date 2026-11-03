@@ -476,8 +476,8 @@ func (n *Node) Join(ctx context.Context, inv *Invite) (Peer, error) {
 
 // JoinWants is Join asking for permissions (spec §2, `wants`): what we want to use on the
 // inviting device. Its person may narrow it; the result comes back as event 0.6
-// ([Node.GrantedBy], OnGranted). nil — we ask for everything, as between one person's own
-// devices.
+// ([Node.GrantedBy], OnGranted); until the first 0.6 the device grants us nothing. nil — we
+// ask for everything, as between one person's own devices (everything until told).
 func (n *Node) JoinWants(ctx context.Context, inv *Invite, wants []Grant) (Peer, error) {
 	addr := Address(inv.Key)
 	var eps []Endpoint
@@ -1047,6 +1047,9 @@ func (n *Node) onPair2Locked(now time.Time, pkt []byte, from Endpoint) {
 		hints.Relay = h.invite.Hints.Relay
 	}
 	p := Peer{Addr: peer, Key: h.invite.Key, Name: pp.Name, PairSecret: h.invite.Secret, Hints: hints, SignKey: pp.SignKey, OS: pp.OS, Kind: pp.Kind, Local: n.isLocalLocked(from)}
+	if h.wants != nil {
+		p.Granted = []Grant{} // asked, so nothing until the person decides (first 0.6, spec §2)
+	}
 	n.Trust.Put(p)
 	s := &session{peer: peer, local: local, remote: u32(pkt[5:9]), send: cs1.Cipher(), recv: cs2.Cipher(), lastRecv: now}
 	n.sessions[local] = s

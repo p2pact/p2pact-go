@@ -148,3 +148,53 @@ func TestWantsAskOnlyForInviteAsk(t *testing.T) {
 	default:
 	}
 }
+
+// A newcomer that asked, and was not yet answered, may use nothing: until the first 0.6 the
+// device grants it an empty list, kept over a restart; one that did not ask has everything.
+func TestWantsNothingUntilTold(t *testing.T) {
+	dir := t.TempDir()
+	a, b := node(t, "Mac", true, nil), nodeIn(t, dir, "App", true, nil)
+	defer a.Close()
+	defer b.Close()
+	setKind(b, KindClient)
+	release := make(chan struct{})
+	a.mu.Lock()
+	a.OnWants = func(p Peer, wants []Grant) ([]Grant, bool) {
+		<-release
+		return []Grant{{"com.acme.x", LevelRead}}, true
+	}
+	a.mu.Unlock()
+	joinWants(t, a, b, []Grant{{"com.acme.x", LevelWrite}})
+	if got := b.GrantedBy(a.ID.Addr()); got == nil || len(got) != 0 {
+		t.Fatalf("before the first 0.6: %v", got)
+	}
+	if p := LoadTrust(dir).Get(a.ID.Addr()); p == nil || p.Granted == nil || len(p.Granted) != 0 {
+		t.Fatalf("not kept over a restart: %+v", p)
+	}
+	close(release)
+	eventually(t, "told", func() bool { return reflect.DeepEqual(b.GrantedBy(a.ID.Addr()), []Grant{{"com.acme.x", LevelRead}}) })
+
+	c := node(t, "Phone", true, nil) // no wants: everything until told
+	defer c.Close()
+	a.mu.Lock()
+	a.OnWants = nil
+	a.mu.Unlock()
+	joinWants(t, a, c, nil)
+	if got := c.GrantedBy(a.ID.Addr()); !reflect.DeepEqual(got, DefaultGrants()) {
+		t.Fatalf("no wants: %v", got)
+	}
+}
+
+// A newcomer that asked for everything and got it still hears 0.6: it cannot tell "everything"
+// from "not yet answered" otherwise.
+func TestWantsEverythingIsTold(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "App", true, nil)
+	defer a.Close()
+	defer b.Close()
+	setKind(b, KindClient)
+	joinWants(t, a, b, []Grant{{AllTools, LevelWrite}})
+	eventually(t, "told everything", func() bool { return reflect.DeepEqual(b.GrantedBy(a.ID.Addr()), DefaultGrants()) })
+	if p := b.Trust.Get(a.ID.Addr()); p.Granted == nil || len(p.Granted) != 1 {
+		t.Fatalf("%+v", p.Granted)
+	}
+}

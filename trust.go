@@ -38,8 +38,8 @@ type Peer struct {
 	// ["*", 2]: a person's own device uses everything. An empty list grants nothing.
 	Grants []Grant `json:"grants"`
 	// Granted is what the device lets us use of its tools (its event 0.6); nil — not told,
-	// which is ["*", 2] as well.
-	Granted []Grant `json:"granted,omitempty"`
+	// which is ["*", 2] as well. Joined with wants: an empty list (nothing) until the first 0.6.
+	Granted []Grant `json:"granted,omitzero"`
 	// Local: we reach the device over our local socket (a plugin's host, spec §3).
 	Local bool `json:"local,omitempty"`
 }
