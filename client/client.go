@@ -204,6 +204,8 @@ func (c *Client) Event(peer string, tool, ev int, args []cbor.RawMessage) {
 		comp.chat.notified(args)
 	case tool == numFleet && ev == 1:
 		comp.fleet.notified(args)
+	case tool == numPlugins && ev == 1:
+		comp.plugins.notified(args)
 	case tool == numPlugins:
 	default:
 		c.ToolEvents.emit(ToolEvent{Computer: comp, Tool: c.node.PeerToolName(peer, tool), ToolNumber: tool, Event: ev, Args: args})

@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"sync"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/p2pact/p2pact-go"
@@ -75,6 +77,12 @@ type PluginGrants struct {
 // PluginsClient is tool 4 `p2pact.plugins` of one computer.
 type PluginsClient struct {
 	computer *Computer
+
+	// Events of the watch ([PluginsClient.Watch]) of this computer.
+	Events Events[PluginEvent]
+
+	mu       sync.Mutex
+	watching bool
 }
 
 func (p *PluginsClient) call(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
@@ -115,14 +123,115 @@ func (p *PluginsClient) Grants(ctx context.Context, name string) (*PluginGrants,
 	}
 	var w struct {
 		Name   string
-		Grants []p2pact.Grant
-		Read   map[string][]int
+		Grants []struct {
+			Tool  string
+			Level json.RawMessage
+		}
+		Read map[string][]int
 	}
 	decode(r, &w)
 	if w.Name == "" {
 		w.Name = name
 	}
-	return &PluginGrants{w.Name, w.Grants, w.Read, r}, nil
+	var grants []p2pact.Grant
+	for _, g := range w.Grants {
+		grants = append(grants, p2pact.Grant{Tool: g.Tool, Level: parseLevel(g.Level)})
+	}
+	return &PluginGrants{w.Name, grants, w.Read, r}, nil
+}
+
+// parseLevel reads a level as the engine sends it ("read"/"write"), or as a number (1/2).
+func parseLevel(raw json.RawMessage) int {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		switch s {
+		case "read":
+			return p2pact.LevelRead
+		case "write":
+			return p2pact.LevelWrite
+		}
+		return 0
+	}
+	var n int
+	if json.Unmarshal(raw, &n) == nil {
+		return n
+	}
+	return 0
+}
+
+// PluginEvent is a `plugins/changed` event: the plugin's entry now.
+type PluginEvent struct {
+	Plugin PluginInfo
+	// Removed: the plugin is gone; Plugin is its last entry.
+	Removed bool
+}
+
+// PluginsWatch is an active watch: Close it to unsubscribe.
+type PluginsWatch struct {
+	// Plugins at the start.
+	Plugins []PluginInfo
+	c       *PluginsClient
+}
+
+// Close unsubscribes.
+func (w *PluginsWatch) Close(ctx context.Context) error { return w.c.Unwatch(ctx) }
+
+// Watch is `plugins/watch`: subscribes to Events (changes of plugins) and returns the list.
+// The subscription is repeated after the computer's next hello.
+func (p *PluginsClient) Watch(ctx context.Context) (*PluginsWatch, error) {
+	p.mu.Lock()
+	p.watching = true
+	p.mu.Unlock()
+	r, err := p.call(ctx, "plugins/watch", nil)
+	if err != nil {
+		p.mu.Lock()
+		p.watching = false
+		p.mu.Unlock()
+		return nil, err
+	}
+	var w struct{ Plugins json.RawMessage }
+	decode(r, &w)
+	return &PluginsWatch{Plugins: parseAll(w.Plugins, parsePlugin), c: p}, nil
+}
+
+// Unwatch is `plugins/unwatch`.
+func (p *PluginsClient) Unwatch(ctx context.Context) error {
+	p.mu.Lock()
+	p.watching = false
+	p.mu.Unlock()
+	_, err := p.call(ctx, "plugins/unwatch", nil)
+	return err
+}
+
+func (p *PluginsClient) reconnected() {
+	p.mu.Lock()
+	w := p.watching
+	p.mu.Unlock()
+	if !w {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, _ = p.call(ctx, "plugins/watch", nil)
+	}()
+}
+
+func (p *PluginsClient) notified(args []cbor.RawMessage) {
+	if len(args) == 0 {
+		return
+	}
+	var msg struct {
+		Method string
+		Params json.RawMessage
+	}
+	decode(toJSON(args[0]), &msg)
+	if msg.Method != "plugins/changed" {
+		return
+	}
+	var rm struct{ Removed bool }
+	decode(msg.Params, &rm)
+	p.Events.emit(PluginEvent{Plugin: parsePlugin(msg.Params), Removed: rm.Removed})
 }
 
 // Enable starts a plugin (and keeps it on across the computer's restarts). Needs write.

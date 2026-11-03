@@ -268,3 +268,38 @@ func TestWaitUntilNotOnline(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestPluginLevelParsing(t *testing.T) {
+	for in, want := range map[string]int{`"read"`: p2pact.LevelRead, `"write"`: p2pact.LevelWrite, `1`: p2pact.LevelRead, `2`: p2pact.LevelWrite, `"x"`: 0, `null`: 0} {
+		if got := parseLevel(json.RawMessage(in)); got != want {
+			t.Fatalf("%s: %d", in, got)
+		}
+	}
+}
+
+func TestPluginsWatchDeliversChanged(t *testing.T) {
+	v := connect(t, nil, nil)
+	p, ctx := v.computer.Plugins(), ctx5(t)
+	events, cancel := p.Events.Chan()
+	defer cancel()
+	w, err := p.Watch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.assertSent(4, "plugins/watch", "p2pact.plugins", "plugins.watch.request")
+	if len(w.Plugins) != 1 || w.Plugins[0].Name != "com.example.hello" || w.Plugins[0].Status != PluginRunning {
+		t.Fatalf("%+v", w.Plugins)
+	}
+	v.engine.notify(4, fixture(t, "p2pact.plugins", "plugins.changed.notification"))
+	if e := next(t, events); e.Removed || e.Plugin.Name != "com.example.hello" || e.Plugin.Status != PluginRunning || e.Plugin.PID != 4242 {
+		t.Fatalf("%+v", e)
+	}
+	v.engine.notify(4, fixture(t, "p2pact.plugins", "plugins.changed.removed.notification"))
+	if e := next(t, events); !e.Removed || e.Plugin.Status != PluginStopped || e.Plugin.Enabled != true {
+		t.Fatalf("%+v", e)
+	}
+	if err := w.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	v.assertSent(4, "plugins/unwatch", "p2pact.plugins", "plugins.unwatch.request")
+}

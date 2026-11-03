@@ -108,6 +108,7 @@ func (c *Computer) helloArrived() {
 	c.mu.Unlock()
 	c.chat.reconnected()
 	c.fleet.reconnected()
+	c.plugins.reconnected()
 	c.readyOnce.Do(func() { close(c.ready) })
 	c.owner.ComputerEvents.emit(ComputerEvent{Type: EventOnline, Computer: c})
 }

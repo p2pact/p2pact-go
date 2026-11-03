@@ -72,7 +72,7 @@ type seenCall struct {
 var (
 	chatRead    = set("initialize", "session/list", "session/load", "_p2pact/older", "_p2pact/commands", "_p2pact/files", "_p2pact/history", "_p2pact/projects", "_p2pact/agents", "_p2pact/image", "_p2pact/diff")
 	fleetRead   = set("fleet/hello", "node/get", "session/list", "session/get", "session/messages", "fleet/watch", "fleet/unwatch")
-	pluginsRead = set("plugins/list", "plugins/log", "plugins/grants")
+	pluginsRead = set("plugins/list", "plugins/log", "plugins/grants", "plugins/watch", "plugins/unwatch")
 )
 
 func set(s ...string) map[string]bool {
