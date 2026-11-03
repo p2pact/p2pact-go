@@ -122,10 +122,11 @@ type peerState struct {
 	// askingInfo: our 0.2 info call is on its way (askInfoLocked); askedInfo: when we asked
 	askingInfo bool
 	askedInfo  time.Time
-	tried      [][]byte        // dictionaries of its list we asked it for and did not get
-	hist       *history        // what we sent it and got from it, to train our dictionary for it
-	sysCalls   map[uint64]bool // our calls of tool 0: their results are not conversation
-	queue      []pending       // conversation messages waiting to be learnt (learn.go)
+	tried      [][]byte           // dictionaries of its list we asked it for and did not get
+	named      map[string]toolRef // its named tools, from its hello (spec §8)
+	hist       *history           // what we sent it and got from it, to train our dictionary for it
+	sysCalls   map[uint64]bool    // our calls of tool 0: their results are not conversation
+	queue      []pending          // conversation messages waiting to be learnt (learn.go)
 	queued     int
 	lastTalk   time.Time
 	inbox      map[uint64]*inbox // calls and events waiting for their turn, per stream
@@ -188,6 +189,10 @@ type Node struct {
 	invites  map[string]*Invite // our invites by id (hex)
 	peers    map[string]*peerState
 	handlers map[[2]int]Handler
+	// named tools (tools.go): name → number and back, versions
+	names    map[string]int
+	numbers  map[int]string
+	versions map[int]int
 	resetAt  map[string]time.Time
 	dicts    *dictStore
 
@@ -208,7 +213,7 @@ func NewNode(dir, name string) (*Node, error) {
 	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, dir: dir, boot: binary.BigEndian.Uint32(randBytes(4)),
 		rel: map[string]*RelayRoad{}, apps: map[*AttachedRoad]bool{}, sessions: map[uint32]*session{}, current: map[string]*session{},
 		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, peers: map[string]*peerState{},
-		handlers: map[[2]int]Handler{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
+		handlers: map[[2]int]Handler{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
 		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
 	n.Handle(0, 2, func(peer string, _ []cbor.RawMessage) ([]any, error) { return n.info(peer), nil })
@@ -673,7 +678,7 @@ func (n *Node) Paths(peer string) []string {
 	return out
 }
 
-// info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints, kind].
+// info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints, kind, {name: [tool, version]}].
 // The dictionaries are those peer may see.
 func (n *Node) info(peer string) []any {
 	n.mu.Lock()
@@ -684,11 +689,11 @@ func (n *Node) info(peer string) []any {
 func (n *Node) infoLocked(peer string) []any {
 	tools := map[int]int{}
 	for k := range n.handlers {
-		if k[0] != 0 {
+		if _, named := n.numbers[k[0]]; k[0] != 0 && !named {
 			tools[k[0]] = 1
 		}
 	}
-	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked()), n.Kind}
+	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked()), n.Kind, n.namedLocked()}
 }
 
 // SetAdvertise announces these addresses instead of our own in invites and hellos: behind
@@ -1135,6 +1140,18 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 				var kind int
 				if cbor.Unmarshal(a[9], &kind) == nil {
 					n.Trust.SetKind(peer, kind)
+				}
+			}
+			ps.named = nil
+			if len(a) >= 11 {
+				var named map[string][]int
+				if cbor.Unmarshal(a[10], &named) == nil {
+					ps.named = map[string]toolRef{}
+					for name, v := range named {
+						if len(v) >= 2 {
+							ps.named[name] = toolRef{v[0], v[1]}
+						}
+					}
 				}
 			}
 			if n.OnHello != nil {
