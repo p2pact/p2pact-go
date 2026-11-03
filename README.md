@@ -72,6 +72,13 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
   while nothing better is up; the session moves to UDP, TCP or a relay as soon as one answers
   and comes back when they fall silent.
 
+## Client for apps
+
+The `client` package is a typed client for the public tools (chat, fleet, plugins) for
+applications that pair with a computer running a P2PACT engine; see
+[examples/client-cli](examples/client-cli) and the
+[apps guide](https://github.com/p2pact/p2pact/blob/main/docs/apps.md).
+
 ## What is implemented
 
 - Pairing by invite (Noise XXpsk2), sessions with data in the first packet (Noise IK).
