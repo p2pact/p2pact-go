@@ -162,6 +162,8 @@ type Node struct {
 	NoCompression bool
 	// NoLearning: do not train our own dictionaries on what we send (spec §5).
 	NoLearning bool
+	// Kind is what this device is for (KindComputer…), told in pairing and the hello (spec §1).
+	Kind int
 
 	advertise *Hints
 	// hintsSent: our addresses as last announced; hintsAt: when last checked (reannounceLocked)
@@ -498,18 +500,46 @@ func (n *Node) Join(ctx context.Context, inv *Invite) (Peer, error) {
 	}
 }
 
-// pairPayload is [name, boot, hints, signing key, os] in the pairing handshake.
-type pairPayload struct {
-	_       struct{} `cbor:",toarray"`
+// Kinds of device (spec §1): what a device is for, told in the pairing payload and the hello.
+const (
+	KindUnknown  = 0 // not said (an older device): guess as before, e.g. by OS
+	KindComputer = 1 // runs agents, serves tools
+	KindClient   = 2 // an app a person holds: a phone, a desktop or web app
+	KindPlugin   = 3 // a program on the same computer that adds tools to it
+)
+
+// pairInfo is the pairing handshake payload [name, boot, hints, signing key, os, kind, wants]:
+// the last two are optional and a shorter one (an older device) leaves them zero; more elements
+// than we know are ignored.
+type pairInfo struct {
 	Name    string
 	Boot    uint32
 	Hints   hintsWire
 	SignKey []byte
 	OS      string
+	Kind    int
+}
+
+func parsePair(b []byte) pairInfo {
+	var a []cbor.RawMessage
+	var p pairInfo
+	if cbor.Unmarshal(b, &a) != nil {
+		return p
+	}
+	for i, v := range []any{&p.Name, &p.Boot, &p.Hints, &p.SignKey, &p.OS, &p.Kind} {
+		if i < len(a) {
+			_ = cbor.Unmarshal(a[i], v)
+		}
+	}
+	return p
 }
 
 func (n *Node) pairPayloadLocked() []byte {
-	b, _ := cbor.Marshal(pairPayload{Name: n.Name, Boot: n.boot, Hints: toWire(n.hintsLocked()), SignKey: n.ID.SignPublic(), OS: runtime.GOOS})
+	a := []any{n.Name, n.boot, toWire(n.hintsLocked()), n.ID.SignPublic(), runtime.GOOS}
+	if n.Kind != KindUnknown {
+		a = append(a, n.Kind)
+	}
+	b, _ := cbor.Marshal(a)
 	return b
 }
 
@@ -521,6 +551,9 @@ func (n *Node) Befriend(p Peer) error {
 	}
 	if old := n.Trust.Get(p.Addr); old != nil {
 		old.Name, old.SignKey, old.OS = p.Name, p.SignKey, p.OS
+		if p.Kind != KindUnknown {
+			old.Kind = p.Kind
+		}
 		n.Trust.Put(*old)
 		return nil
 	}
@@ -640,7 +673,7 @@ func (n *Node) Paths(peer string) []string {
 	return out
 }
 
-// info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints].
+// info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints, kind].
 // The dictionaries are those peer may see.
 func (n *Node) info(peer string) []any {
 	n.mu.Lock()
@@ -655,7 +688,7 @@ func (n *Node) infoLocked(peer string) []any {
 			tools[k[0]] = 1
 		}
 	}
-	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked())}
+	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked()), n.Kind}
 }
 
 // SetAdvertise announces these addresses instead of our own in invites and hellos: behind
@@ -908,8 +941,7 @@ func (n *Node) onPair2Locked(now time.Time, pkt []byte, from Endpoint) {
 		delete(n.hs, local)
 		return
 	}
-	var pp pairPayload
-	_ = cbor.Unmarshal(payload, &pp)
+	pp := parsePair(payload)
 	msg3, cs1, cs2, err := h.hs.WriteMessage(nil, n.pairPayloadLocked())
 	if err != nil || cs1 == nil {
 		return
@@ -926,7 +958,7 @@ func (n *Node) onPair2Locked(now time.Time, pkt []byte, from Endpoint) {
 	if hints.Relay == nil {
 		hints.Relay = h.invite.Hints.Relay
 	}
-	p := Peer{Addr: peer, Key: h.invite.Key, Name: pp.Name, PairSecret: h.invite.Secret, Hints: hints, SignKey: pp.SignKey, OS: pp.OS}
+	p := Peer{Addr: peer, Key: h.invite.Key, Name: pp.Name, PairSecret: h.invite.Secret, Hints: hints, SignKey: pp.SignKey, OS: pp.OS, Kind: pp.Kind}
 	n.Trust.Put(p)
 	s := &session{peer: peer, local: local, remote: u32(pkt[5:9]), send: cs1.Cipher(), recv: cs2.Cipher(), lastRecv: now}
 	n.sessions[local] = s
@@ -957,10 +989,9 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	}
 	key := h.hs.PeerStatic()
 	peer := Address(key)
-	var pp pairPayload
-	_ = cbor.Unmarshal(payload, &pp)
+	pp := parsePair(payload)
 	p := Peer{Addr: peer, Key: append([]byte(nil), key...), Name: pp.Name, PairSecret: h.invite.Secret, Hints: fromWire(pp.Hints),
-		SignKey: pp.SignKey, OS: pp.OS, Via: hexs(h.invite.ID())}
+		SignKey: pp.SignKey, OS: pp.OS, Kind: pp.Kind, Via: hexs(h.invite.ID())}
 	n.Trust.Put(p)
 	// the joiner was the initiator; we are the responder
 	s := &session{peer: peer, local: local, remote: h.remoteIdx, send: cs2.Cipher(), recv: cs1.Cipher(), lastRecv: now}
@@ -1100,6 +1131,12 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			_ = cbor.Unmarshal(a[4], &goos)
 			_ = cbor.Unmarshal(a[8], &hw)
 			n.Trust.SetHints(peer, name, goos, fromWire(hw))
+			if len(a) >= 10 {
+				var kind int
+				if cbor.Unmarshal(a[9], &kind) == nil {
+					n.Trust.SetKind(peer, kind)
+				}
+			}
 			if n.OnHello != nil {
 				go n.OnHello(peer)
 			}

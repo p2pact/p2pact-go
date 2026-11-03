@@ -33,6 +33,7 @@ type Peer struct {
 	SignKey    []byte `json:"sign_key,omitempty"` // Ed25519
 	OS         string `json:"os,omitempty"`       // runtime.GOOS; android and ios are phones
 	Via        string `json:"via,omitempty"`      // joined through our invite with this id (hex)
+	Kind       int    `json:"kind,omitempty"`     // what the device is for (KindComputer…); 0 — not said
 }
 
 // Phone reports a phone OS: a phone is never the family parent (spec/family.md §1).
@@ -91,6 +92,16 @@ func (t *Trust) Put(p Peer) {
 	t.peers[p.Addr] = &p
 	t.saveLocked()
 	t.mu.Unlock()
+}
+
+// SetKind stores the kind a device told in its hello.
+func (t *Trust) SetKind(addr string, kind int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if p := t.peers[addr]; p != nil && p.Kind != kind {
+		p.Kind = kind
+		t.saveLocked()
+	}
 }
 
 // SetHints stores fresh hints of a known device (from its hello).
