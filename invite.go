@@ -34,16 +34,41 @@ type inviteWire struct {
 	Hints  hintsWire
 }
 
-// hintsWire is [UDP addresses, [relay address, fingerprint], TCP addresses].
+// hintsWire is [UDP addresses, [relay address, fingerprint], TCP addresses, WebSocket URLs of
+// a relay]. The fourth element is written only when there are URLs (older devices read three).
 type hintsWire struct {
-	_     struct{} `cbor:",toarray"`
 	UDP   []string
 	Relay []string
 	TCP   []string
+	WS    []string
+}
+
+func (w hintsWire) MarshalCBOR() ([]byte, error) {
+	a := []any{w.UDP, w.Relay, w.TCP}
+	if len(w.WS) > 0 {
+		a = append(a, w.WS)
+	}
+	return cbor.Marshal(a)
+}
+
+func (w *hintsWire) UnmarshalCBOR(b []byte) error {
+	var raw []cbor.RawMessage
+	if err := cbor.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*w = hintsWire{}
+	for i, p := range []*[]string{&w.UDP, &w.Relay, &w.TCP, &w.WS} {
+		if i < len(raw) {
+			if err := cbor.Unmarshal(raw[i], p); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func toWire(h Hints) hintsWire {
-	w := hintsWire{UDP: h.UDP, TCP: h.TCP}
+	w := hintsWire{UDP: h.UDP, TCP: h.TCP, WS: h.WS}
 	if h.Relay != nil {
 		w.Relay = []string{h.Relay.Addr, h.Relay.FP}
 	}
@@ -51,7 +76,7 @@ func toWire(h Hints) hintsWire {
 }
 
 func fromWire(w hintsWire) Hints {
-	h := Hints{UDP: w.UDP, TCP: w.TCP}
+	h := Hints{UDP: w.UDP, TCP: w.TCP, WS: w.WS}
 	if len(w.Relay) == 2 && w.Relay[0] != "" {
 		h.Relay = &RelayHint{Addr: w.Relay[0], FP: w.Relay[1]}
 	}

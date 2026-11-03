@@ -14,6 +14,7 @@ type Hints struct {
 	UDP   []string   `json:"udp,omitempty"`   // ip:port addresses
 	TCP   []string   `json:"tcp,omitempty"`   // ip:port addresses (fallback road)
 	Relay *RelayHint `json:"relay,omitempty"` // its relay
+	WS    []string   `json:"ws,omitempty"`    // WebSocket URLs of a relay (browsers dial these)
 }
 
 // RelayHint is a relay: its address and the SHA-256 of its certificate (hex).
@@ -157,6 +158,9 @@ func (t *Trust) SetHints(addr, name, os string, h Hints) {
 	}
 	if h.Relay != nil {
 		p.Hints.Relay = h.Relay
+	}
+	if len(h.WS) > 0 {
+		p.Hints.WS = h.WS
 	}
 	t.saveLocked()
 }

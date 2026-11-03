@@ -37,6 +37,9 @@ type AppRoadConfig struct {
 	// on the road before the first measurement, so a slow link does not get a window meant for
 	// a fast one and its timers do not fire on its queue.
 	Rate int
+	// Direct declares the link a direct path between the two devices (a WebRTC data channel,
+	// a LAN link): it ranks with TCP, so the session prefers it to a relay (spec §7).
+	Direct bool
 }
 
 // MaxRoadPacket is the largest packet a road must carry: MaxPacket, and a handshake start with
@@ -76,7 +79,7 @@ var appRoadSeq struct {
 // to it on this road like on its hints, and starts a session over it at once if it has none.
 // With peer "" the road is bound by what arrives on it: a handshake or session packet names
 // the device, and the answers go back the same way; until then it is offered for pairing
-// (Join). The road ranks below UDP, TCP and a relay: it carries the session while nothing
+// (Join). The road ranks below UDP, TCP and a relay (with TCP if cfg.Direct): it carries the session while nothing
 // better is up, and the session moves to a better road as soon as one answers (spec §7).
 func (n *Node) AttachRoad(peer string, r AppRoad, cfg AppRoadConfig) (*AttachedRoad, error) {
 	if r == nil || cfg.MTU < 1 {

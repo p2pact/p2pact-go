@@ -1046,6 +1046,9 @@ func (n *Node) onPair2Locked(now time.Time, pkt []byte, from Endpoint) {
 	if hints.Relay == nil {
 		hints.Relay = h.invite.Hints.Relay
 	}
+	if len(hints.WS) == 0 {
+		hints.WS = h.invite.Hints.WS
+	}
 	p := Peer{Addr: peer, Key: h.invite.Key, Name: pp.Name, PairSecret: h.invite.Secret, Hints: hints, SignKey: pp.SignKey, OS: pp.OS, Kind: pp.Kind, Local: n.isLocalLocked(from)}
 	if h.wants != nil {
 		p.Granted = []Grant{} // asked, so nothing until the person decides (first 0.6, spec §2)
@@ -1491,7 +1494,10 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 // roadRank orders kinds of roads (spec §7): UDP, then TCP, then a relay, then a road the
 // application provides (a slow local link: Bluetooth).
 func roadRank(r Road) int {
-	if _, ok := r.(*AttachedRoad); ok {
+	if a, ok := r.(*AttachedRoad); ok {
+		if a.cfg.Direct {
+			return 1 // a direct link (a WebRTC data channel) ranks with TCP, above a relay
+		}
 		return 3
 	}
 	switch r.Name() {
