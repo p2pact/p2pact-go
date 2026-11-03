@@ -173,6 +173,12 @@ func TestGrantsLevelHandler(t *testing.T) {
 		return []any{m}, nil
 	})
 	pair(t, a, b)
+	a.mu.Lock()
+	tools := a.infoLocked(b.ID.Addr())[3].(map[int]int)
+	a.mu.Unlock()
+	if tools[1] != 1 {
+		t.Errorf("a tool with a level handler is missing from the hello: %v", tools)
+	}
 	if err := a.SetGrants(b.ID.Addr(), []Grant{{"p2pact.chat", LevelRead}}); err != nil {
 		t.Fatal(err)
 	}

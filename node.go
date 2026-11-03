@@ -743,10 +743,16 @@ func (n *Node) info(peer string) []any {
 
 func (n *Node) infoLocked(peer string) []any {
 	tools := map[int]int{}
-	for k := range n.handlers {
-		if _, named := n.numbers[k[0]]; k[0] != 0 && !named {
-			tools[k[0]] = 1
+	add := func(tool int) {
+		if _, named := n.numbers[tool]; tool != 0 && !named {
+			tools[tool] = 1
 		}
+	}
+	for k := range n.handlers {
+		add(k[0])
+	}
+	for k := range n.levelHandlers { // tools whose handlers check the caller's level are tools too
+		add(k[0])
 	}
 	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked()), n.Kind, n.namedLocked()}
 }
