@@ -15,12 +15,14 @@ import (
 // packet. Connections are made on demand and reused both ways; sessions do not depend on them,
 // so a dropped connection costs nothing but a reconnect.
 type TCPRoad struct {
-	ln    net.Listener
-	recv  func([]byte, Endpoint)
-	mu    sync.Mutex
-	conns map[string]*tcpConn // by remote address as we know it
+	network, name string // "tcp"/"tcp", or "unix"/"local" (the local socket road, local.go)
+	ln            net.Listener
+	recv          func([]byte, Endpoint)
+	mu            sync.Mutex
+	conns         map[string]*tcpConn // by remote address as we know it
 	// paused: no connections (the node pauses); the listener stays and refuses them
 	paused atomic.Bool
+	seq    atomic.Uint64
 
 	// Delay and Rate are for tests, as on UDPRoad.
 	Delay time.Duration
@@ -44,11 +46,16 @@ type tcpOut struct {
 
 // listenTCP opens the TCP road; addr "" — dial only, no listener.
 func listenTCP(addr string, recv func([]byte, Endpoint)) (*TCPRoad, error) {
-	t := &TCPRoad{recv: recv, conns: map[string]*tcpConn{}}
+	return listenStream("tcp", "tcp", addr, recv)
+}
+
+// listenStream opens a stream road of a network ("tcp", "unix"); addr "" - dial only.
+func listenStream(network, name, addr string, recv func([]byte, Endpoint)) (*TCPRoad, error) {
+	t := &TCPRoad{network: network, name: name, recv: recv, conns: map[string]*tcpConn{}}
 	if addr == "" {
 		return t, nil
 	}
-	ln, err := net.Listen("tcp", addr)
+	ln, err := net.Listen(network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -63,14 +70,18 @@ func listenTCP(addr string, recv func([]byte, Endpoint)) (*TCPRoad, error) {
 				c.Close()
 				continue
 			}
-			tc := t.newConn(c.RemoteAddr().String())
-			go t.serve(c, c.RemoteAddr().String(), tc)
+			remote := c.RemoteAddr().String()
+			if network == "unix" { // peers of a unix socket have no address: number them
+				remote = "local-" + strconv.FormatUint(t.seq.Add(1), 10)
+			}
+			tc := t.newConn(remote)
+			go t.serve(c, remote, tc)
 		}
 	}()
 	return t, nil
 }
 
-func (t *TCPRoad) Name() string { return "tcp" }
+func (t *TCPRoad) Name() string { return t.name }
 
 // Stats returns the counters (frame bytes, without TCP/IP headers).
 func (t *TCPRoad) Stats() RoadStats {
@@ -128,7 +139,7 @@ func (t *TCPRoad) Send(addr string, pkt []byte) error {
 }
 
 func (t *TCPRoad) dial(addr string, tc *tcpConn) {
-	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	c, err := net.DialTimeout(t.network, addr, 10*time.Second)
 	if err != nil {
 		t.drop(addr, tc)
 		return
@@ -191,7 +202,7 @@ func (t *TCPRoad) drop(addr string, tc *tcpConn) {
 
 // localAddrs lists our TCP addresses for hints.
 func (t *TCPRoad) localAddrs() []string {
-	if t.ln == nil {
+	if t.ln == nil || t.network != "tcp" {
 		return nil
 	}
 	la := t.ln.Addr().(*net.TCPAddr)

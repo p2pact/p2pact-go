@@ -40,6 +40,8 @@ type Peer struct {
 	// Granted is what the device lets us use of its tools (its event 0.6); nil — not told,
 	// which is ["*", 2] as well.
 	Granted []Grant `json:"granted,omitempty"`
+	// Local: we reach the device over our local socket (a plugin's host, spec §3).
+	Local bool `json:"local,omitempty"`
 }
 
 // Phone reports a phone OS: a phone is never the family parent (spec/family.md §1).

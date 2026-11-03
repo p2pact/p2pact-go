@@ -187,9 +187,12 @@ type Node struct {
 	mu   sync.Mutex
 	udp  *UDPRoad
 	tcp  *TCPRoad
-	own  *RelayHint
-	rel  map[string]*RelayRoad  // by server address
-	apps map[*AttachedRoad]bool // roads the application provides (approad.go)
+	loc  *TCPRoad // the local socket road (local.go)
+	// localPath: the socket we listen on, or dial
+	localPath string
+	own       *RelayHint
+	rel       map[string]*RelayRoad  // by server address
+	apps      map[*AttachedRoad]bool // roads the application provides (approad.go)
 	// paused: the device sleeps (SetPaused): nothing is sent, nothing is taken in
 	paused bool
 
@@ -197,8 +200,10 @@ type Node struct {
 	current  map[string]*session // the best session with a device
 	hs       map[uint32]*handshake
 	invites  map[string]*Invite // our invites by id (hex)
-	peers    map[string]*peerState
-	handlers map[[2]int]Handler
+	// inviteGrants: invites made for programs (PluginInvite) and the grants their install gave
+	inviteGrants map[string][]Grant
+	peers        map[string]*peerState
+	handlers     map[[2]int]Handler
 	// grants (grants.go): methods that check the level themselves, methods marked read
 	levelHandlers map[[2]int]LevelHandler
 	readMethods   map[[2]int]bool
@@ -225,7 +230,7 @@ func NewNode(dir, name string) (*Node, error) {
 	}
 	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, dir: dir, boot: binary.BigEndian.Uint32(randBytes(4)),
 		rel: map[string]*RelayRoad{}, apps: map[*AttachedRoad]bool{}, sessions: map[uint32]*session{}, current: map[string]*session{},
-		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, peers: map[string]*peerState{},
+		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, inviteGrants: map[string][]Grant{}, peers: map[string]*peerState{},
 		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
 		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
@@ -348,6 +353,9 @@ func (n *Node) Close() {
 	}
 	if n.tcp != nil {
 		n.tcp.close()
+	}
+	if n.loc != nil {
+		n.loc.close()
 	}
 	for _, r := range n.rel {
 		r.close()
@@ -472,6 +480,9 @@ func (n *Node) JoinWants(ctx context.Context, inv *Invite, wants []Grant) (Peer,
 		defer rel.leave(hexs(inv.ID()))
 		eps = append(eps, Endpoint{Road: rel, Addr: hexs(inv.ID())})
 	}
+	if n.loc != nil && n.localPath != "" { // a device on this computer, over its socket
+		eps = append(eps, Endpoint{Road: n.loc, Addr: n.localPath})
+	}
 	for a := range n.apps { // a link the application opened to a device it has not named
 		if a.peer == "" || a.peer == addr {
 			eps = append(eps, Endpoint{Road: a, Addr: a.id})
@@ -583,6 +594,9 @@ func (n *Node) pairPayloadLocked(wants []Grant) []byte {
 // Befriend adds a known device without a pairing handshake: its key comes from the family
 // book; the pair secret comes from both permanent keys (Identity.Shared).
 func (n *Node) Befriend(p Peer) error {
+	if p.Kind == KindPlugin {
+		return errors.New("a plugin is never in the family")
+	}
 	if len(p.Key) != 32 || Address(p.Key) != p.Addr {
 		return errors.New("key does not match address")
 	}
@@ -881,8 +895,12 @@ func (n *Node) onInitLocked(now time.Time, pkt []byte, from Endpoint) {
 		return
 	}
 	peer := Address(hs.PeerStatic())
-	if n.Trust.Get(peer) == nil {
+	known := n.Trust.Get(peer)
+	if known == nil {
 		return // silence to strangers (spec §4.2)
+	}
+	if known.Kind == KindPlugin && !n.isLocalLocked(from) {
+		return // a plugin is reachable over the local socket only (spec §2)
 	}
 	ps := n.peerLocked(peer)
 	ts := binary.BigEndian.Uint64(payload[:8])
@@ -1004,7 +1022,7 @@ func (n *Node) onPair2Locked(now time.Time, pkt []byte, from Endpoint) {
 	if hints.Relay == nil {
 		hints.Relay = h.invite.Hints.Relay
 	}
-	p := Peer{Addr: peer, Key: h.invite.Key, Name: pp.Name, PairSecret: h.invite.Secret, Hints: hints, SignKey: pp.SignKey, OS: pp.OS, Kind: pp.Kind}
+	p := Peer{Addr: peer, Key: h.invite.Key, Name: pp.Name, PairSecret: h.invite.Secret, Hints: hints, SignKey: pp.SignKey, OS: pp.OS, Kind: pp.Kind, Local: n.isLocalLocked(from)}
 	n.Trust.Put(p)
 	s := &session{peer: peer, local: local, remote: u32(pkt[5:9]), send: cs1.Cipher(), recv: cs2.Cipher(), lastRecv: now}
 	n.sessions[local] = s
@@ -1028,6 +1046,11 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	if err != nil || cs1 == nil {
 		return
 	}
+	pp := parsePair(payload)
+	preset, forProgram := n.inviteGrants[hexs(h.invite.ID())]
+	if (pp.Kind == KindPlugin || forProgram) && (pp.Kind != KindPlugin || !n.isLocalLocked(from)) {
+		return // a plugin pairs over the local socket only, with an invite made for programs (spec §2)
+	}
 	delete(n.hs, local)
 	delete(n.invites, hexs(h.invite.ID())) // single use
 	if n.own != nil {
@@ -1035,7 +1058,6 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	}
 	key := h.hs.PeerStatic()
 	peer := Address(key)
-	pp := parsePair(payload)
 	p := Peer{Addr: peer, Key: append([]byte(nil), key...), Name: pp.Name, PairSecret: h.invite.Secret, Hints: fromWire(pp.Hints),
 		SignKey: pp.SignKey, OS: pp.OS, Kind: pp.Kind, Via: hexs(h.invite.ID())}
 	// what the newcomer may use (spec §2): without wants it asks for everything and keeps the
@@ -1049,6 +1071,13 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 		ask = true
 		p.Grants = []Grant{}
 	}
+	if forProgram { // the install gave the grants: nobody is asked
+		ask, p.Grants = false, cleanGrants(preset)
+	}
+	if pp.Kind == KindPlugin { // reachable over the local socket only
+		p.Hints = Hints{}
+	}
+	delete(n.inviteGrants, hexs(h.invite.ID()))
 	n.Trust.Put(p)
 	// the joiner was the initiator; we are the responder
 	s := &session{peer: peer, local: local, remote: h.remoteIdx, send: cs2.Cipher(), recv: cs1.Cipher(), lastRecv: now}
@@ -1399,6 +1428,12 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 		}
 		out = append(out, ps.eps[k])
 	}
+	if p.Local && n.loc != nil && n.localPath != "" { // the device we dial on this computer
+		add(Endpoint{Road: n.loc, Addr: n.localPath})
+	}
+	if p.Kind == KindPlugin { // reachable over the local socket only, on the connection it opened
+		return out
+	}
 	if n.udp != nil {
 		for _, a := range p.Hints.UDP {
 			add(Endpoint{Road: n.udp, Addr: a})
@@ -1429,7 +1464,7 @@ func roadRank(r Road) int {
 	switch r.Name() {
 	case "udp":
 		return 0
-	case "tcp":
+	case "tcp", "local":
 		return 1
 	}
 	return 2
