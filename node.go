@@ -162,6 +162,10 @@ type Node struct {
 	// runs on its own goroutine and may wait for the person; the newcomer can use nothing
 	// meanwhile. OnPaired follows when it accepts. nil — the newcomer gets what it asked for.
 	OnWants func(p Peer, wants []Grant) (grants []Grant, ok bool)
+	// OnAsk is OnWants for the invites made with InviteAsk only: the application asks its
+	// person about newcomers that came by those, and nobody else (invites made with Invite
+	// still go to OnWants, or grant what the newcomer asked). nil — OnWants decides for them too.
+	OnAsk func(p Peer, wants []Grant) (grants []Grant, ok bool)
 	// OnGranted is called when a known device tells what we may use of its tools (event 0.6).
 	OnGranted func(peer string, grants []Grant)
 	// OnHello is called when a known device sends its hello (new session or pairing).
@@ -202,8 +206,10 @@ type Node struct {
 	invites  map[string]*Invite // our invites by id (hex)
 	// inviteGrants: invites made for programs (PluginInvite) and the grants their install gave
 	inviteGrants map[string][]Grant
-	peers        map[string]*peerState
-	handlers     map[[2]int]Handler
+	// inviteAsk: invites made with InviteAsk (their newcomers go to OnAsk)
+	inviteAsk map[string]bool
+	peers     map[string]*peerState
+	handlers  map[[2]int]Handler
 	// grants (grants.go): methods that check the level themselves, methods marked read
 	levelHandlers map[[2]int]LevelHandler
 	readMethods   map[[2]int]bool
@@ -231,7 +237,7 @@ func NewNode(dir, name string) (*Node, error) {
 	}
 	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, dir: dir, boot: binary.BigEndian.Uint32(randBytes(4)),
 		rel: map[string]*RelayRoad{}, apps: map[*AttachedRoad]bool{}, sessions: map[uint32]*session{}, current: map[string]*session{},
-		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, inviteGrants: map[string][]Grant{}, peers: map[string]*peerState{},
+		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, inviteGrants: map[string][]Grant{}, inviteAsk: map[string]bool{}, peers: map[string]*peerState{},
 		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, toolHandlers: map[int]ToolHandler{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
 		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
@@ -449,6 +455,17 @@ func (n *Node) Invite(ttl time.Duration) *Invite {
 	if n.own != nil && !n.paused { // paused: joined on resume
 		n.relayLocked(*n.own).join(hexs(inv.ID()), "a")
 	}
+	return inv
+}
+
+// InviteAsk is Invite for an application that asks its person about each newcomer: whoever
+// pairs by it goes to [Node.OnAsk] (spec §2, "Permissions asked"); other invites are
+// unaffected.
+func (n *Node) InviteAsk(ttl time.Duration) *Invite {
+	inv := n.Invite(ttl)
+	n.mu.Lock()
+	n.inviteAsk[hexs(inv.ID())] = true
+	n.mu.Unlock()
 	return inv
 }
 
@@ -1074,7 +1091,12 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	if pp.HasWants {
 		p.Grants = cleanGrants(pp.Wants)
 	}
-	if n.OnWants != nil {
+	on := n.OnWants
+	if n.inviteAsk[hexs(h.invite.ID())] && n.OnAsk != nil {
+		on = n.OnAsk
+	}
+	delete(n.inviteAsk, hexs(h.invite.ID()))
+	if on != nil {
 		ask = true
 		p.Grants = []Grant{}
 	}
@@ -1098,7 +1120,6 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 		if !pp.HasWants {
 			wants = DefaultGrants()
 		}
-		on := n.OnWants
 		n.sendInfoLocked(peer)
 		n.goLocked(func() {
 			grants, ok := on(p, cleanGrants(wants))

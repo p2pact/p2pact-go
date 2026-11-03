@@ -109,3 +109,42 @@ func TestWantsRefused(t *testing.T) {
 	}
 	eventually(t, "forgotten", func() bool { return a.Trust.Get(b.ID.Addr()) == nil })
 }
+
+// OnAsk is asked only about newcomers that came by an InviteAsk invite; others keep what they
+// asked for (OnWants unset).
+func TestWantsAskOnlyForInviteAsk(t *testing.T) {
+	a, b, c := node(t, "Mac", true, nil), node(t, "App", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	defer c.Close()
+	setKind(b, KindClient)
+	asked := make(chan string, 4)
+	a.mu.Lock()
+	a.OnAsk = func(p Peer, wants []Grant) ([]Grant, bool) {
+		asked <- p.Name
+		return []Grant{{"p2pact.chat", LevelRead}}, true
+	}
+	a.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	inv, _ := ParseInvite(a.InviteAsk(10 * time.Minute).String())
+	if _, err := b.JoinWants(ctx, inv, []Grant{{AllTools, LevelWrite}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := <-asked; n != "App" {
+		t.Fatalf("asked about %q", n)
+	}
+	eventually(t, "narrowed", func() bool {
+		return reflect.DeepEqual(a.Grants(b.ID.Addr()), []Grant{{"p2pact.chat", LevelRead}})
+	})
+	// a plain invite: not asked, gets what it wants
+	joinWants(t, a, c, []Grant{{"com.acme.x", LevelWrite}})
+	eventually(t, "plain invite grants as asked", func() bool {
+		return reflect.DeepEqual(a.Grants(c.ID.Addr()), []Grant{{"com.acme.x", LevelWrite}})
+	})
+	select {
+	case n := <-asked:
+		t.Fatalf("asked about %q on a plain invite", n)
+	default:
+	}
+}
