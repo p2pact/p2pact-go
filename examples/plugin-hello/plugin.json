@@ -1,0 +1,10 @@
+{
+  "name": "dev.p2pact.example.hello",
+  "version": "0.1.0",
+  "title": "Hello example",
+  "run": ["./plugin-hello"],
+  "tools": ["dev.p2pact.example.hello"],
+  "read": {"dev.p2pact.example.hello": [1]},
+  "needs": [],
+  "platforms": ["darwin", "linux"]
+}
