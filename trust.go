@@ -34,6 +34,12 @@ type Peer struct {
 	OS         string `json:"os,omitempty"`       // runtime.GOOS; android and ios are phones
 	Via        string `json:"via,omitempty"`      // joined through our invite with this id (hex)
 	Kind       int    `json:"kind,omitempty"`     // what the device is for (KindComputer…); 0 — not said
+	// Grants is what we let this device use of ours (spec §8.1); nil — never set, which is
+	// ["*", 2]: a person's own device uses everything. An empty list grants nothing.
+	Grants []Grant `json:"grants"`
+	// Granted is what the device lets us use of its tools (its event 0.6); nil — not told,
+	// which is ["*", 2] as well.
+	Granted []Grant `json:"granted,omitempty"`
 }
 
 // Phone reports a phone OS: a phone is never the family parent (spec/family.md §1).
@@ -100,6 +106,29 @@ func (t *Trust) SetKind(addr string, kind int) {
 	defer t.mu.Unlock()
 	if p := t.peers[addr]; p != nil && p.Kind != kind {
 		p.Kind = kind
+		t.saveLocked()
+	}
+}
+
+// SetGrants stores what we let a known device use; false — no such device.
+func (t *Trust) SetGrants(addr string, g []Grant) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p := t.peers[addr]
+	if p == nil {
+		return false
+	}
+	p.Grants = append([]Grant{}, g...)
+	t.saveLocked()
+	return true
+}
+
+// SetGranted stores what a known device told us we may use of its tools.
+func (t *Trust) SetGranted(addr string, g []Grant) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if p := t.peers[addr]; p != nil {
+		p.Granted = append([]Grant{}, g...)
 		t.saveLocked()
 	}
 }

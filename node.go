@@ -154,6 +154,8 @@ type Node struct {
 	OnEvent func(peer string, tool, event int, args []cbor.RawMessage)
 	// OnPaired is called after pairing (on either side).
 	OnPaired func(p Peer)
+	// OnGranted is called when a known device tells what we may use of its tools (event 0.6).
+	OnGranted func(peer string, grants []Grant)
 	// OnHello is called when a known device sends its hello (new session or pairing).
 	OnHello func(peer string)
 	// OnHeld is called when messages from a device waited too long for a dictionary or its list
@@ -189,6 +191,9 @@ type Node struct {
 	invites  map[string]*Invite // our invites by id (hex)
 	peers    map[string]*peerState
 	handlers map[[2]int]Handler
+	// grants (grants.go): methods that check the level themselves, methods marked read
+	levelHandlers map[[2]int]LevelHandler
+	readMethods   map[[2]int]bool
 	// named tools (tools.go): name → number and back, versions
 	names    map[string]int
 	numbers  map[int]string
@@ -213,11 +218,12 @@ func NewNode(dir, name string) (*Node, error) {
 	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, dir: dir, boot: binary.BigEndian.Uint32(randBytes(4)),
 		rel: map[string]*RelayRoad{}, apps: map[*AttachedRoad]bool{}, sessions: map[uint32]*session{}, current: map[string]*session{},
 		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, peers: map[string]*peerState{},
-		handlers: map[[2]int]Handler{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
+		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
 		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
 	n.Handle(0, 2, func(peer string, _ []cbor.RawMessage) ([]any, error) { return n.info(peer), nil })
 	n.Handle(0, 5, n.dictHandler)
+	n.Handle(0, 6, n.grantsHandler)
 	return n, nil
 }
 
@@ -653,6 +659,15 @@ func (n *Node) EventOn(peer string, stream uint64, tool, event int, args ...any)
 	if ps == nil {
 		return errors.New("unknown device")
 	}
+	if tool != 0 { // a tool's events go only to devices with at least read on it (spec §8.1)
+		var grants []Grant
+		if p := n.Trust.Get(peer); p != nil {
+			grants = p.Grants
+		}
+		if GrantLevel(grants, n.toolNameLocked(tool)) < LevelRead {
+			return nil
+		}
+	}
 	n.pushLocked(ps, msg, stream, tool != 0, false)
 	return nil
 }
@@ -1028,6 +1043,7 @@ func (n *Node) sendInfoLocked(peer string) {
 	n.hintsSent, _ = cbor.Marshal(toWire(n.hintsLocked())) // what the devices know of us (reannounceLocked)
 	msg, _ := cbor.Marshal(append([]any{3, 0, 2}, n.infoLocked(peer)...))
 	n.pushLocked(n.peerLocked(peer), msg, 0, false, false)
+	n.grantsEventLocked(peer)
 }
 
 // messageLocked handles a reassembled message (spec §6).
@@ -1055,6 +1071,19 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			n.hearLocked(ps, msg)
 		}
 		h := n.handlers[[2]int{tool, method}]
+		var level int
+		forbidden := false
+		if tool != 0 { // grants (spec §8.1): tool 0 is always allowed
+			var grants []Grant
+			if p := n.Trust.Get(peer); p != nil {
+				grants = p.Grants
+			}
+			level = GrantLevel(grants, n.toolNameLocked(tool))
+			forbidden = level < n.requiredLevelLocked(tool, method)
+		}
+		if lh := n.levelHandlers[[2]int{tool, method}]; lh != nil && !forbidden {
+			h = func(peer string, args []cbor.RawMessage) ([]any, error) { return lh(peer, level, args) }
+		}
 		args := a[4:]
 		boot := ps.boot
 		reply := func(res []any, err error) {
@@ -1082,6 +1111,10 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			n.mu.Unlock()
 		}
 		run := func() {
+			if forbidden {
+				reply(nil, &Error{Code: ErrForbidden, Text: "forbidden"})
+				return
+			}
 			if h == nil {
 				reply(nil, &Error{Code: ErrNoMethod, Text: "no such method"})
 				return
@@ -1161,6 +1194,15 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			_ = cbor.Unmarshal(a[7], &ps.dicts)
 			n.fetchNewLocked(peer, ps)
 			n.drainLocked(peer, ps)
+			return
+		}
+		if tool == 0 && ev == 6 && len(a) >= 4 { // what we may use of its tools
+			if g, ok := parseGrants(a[3]); ok {
+				n.Trust.SetGranted(peer, g)
+				if n.OnGranted != nil {
+					go n.OnGranted(peer, g)
+				}
+			}
 			return
 		}
 		if tool == 0 && ev == 5 && len(a) >= 4 { // the dictionary list changed
