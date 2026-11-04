@@ -224,6 +224,7 @@ type Node struct {
 	obsFor       string
 	obsResolving bool
 	obsAt        time.Time
+	obsForce     bool // a forced request waits for its second (observeLocked)
 	obsSent      map[[16]byte]observeReq
 
 	sessions map[uint32]*session // by our index

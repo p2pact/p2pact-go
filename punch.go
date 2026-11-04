@@ -37,12 +37,15 @@ type observeReq struct {
 
 // observeLocked sends an observe request to our relay over our UDP socket: when its time has
 // come, or now (force) when the relay road came up or our socket changed — but not more than
-// once a second.
+// once a second: a forced request that comes too soon waits for maintainLocked, it is not lost.
 func (n *Node) observeLocked(now time.Time, force bool) {
+	if force {
+		n.obsForce = true
+	}
 	if n.paused || n.udp == nil || n.own == nil || n.stoppedLocked() {
 		return
 	}
-	if gap := now.Sub(n.obsAt); gap < time.Second || (!force && gap < observeEvery) {
+	if gap := now.Sub(n.obsAt); gap < time.Second || (!n.obsForce && gap < observeEvery) {
 		return
 	}
 	// a relay that stopped answering (another network, an old relay): its last answer is stale
@@ -66,7 +69,7 @@ func (n *Node) observeLocked(now time.Time, force bool) {
 		}
 		return
 	}
-	n.obsAt = now
+	n.obsAt, n.obsForce = now, false
 	for k, r := range n.obsSent {
 		if now.Sub(r.at) > 2*observeEvery || r.to != n.obsTo {
 			delete(n.obsSent, k)

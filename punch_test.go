@@ -242,3 +242,42 @@ func TestPunchAcrossRelay(t *testing.T) {
 		t.Fatalf("%d UDP packets for 20 KB: not on UDP", sent)
 	}
 }
+
+// Forced observes (relay set, relay road up, socket changed, resumed) go out at most once a
+// second, and one that comes too soon is sent once the second is up, not lost.
+func TestObserveForcedOncePerSecond(t *testing.T) {
+	fake, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fake.Close()
+	var got atomic.Int32
+	go func() {
+		buf := make([]byte, 100)
+		for {
+			n, _, err := fake.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n == observeReqLen && buf[0] == pObserve {
+				got.Add(1)
+			}
+		}
+	}()
+	h := RelayHint{Addr: fake.LocalAddr().String()}
+	a := node(t, "Mac", true, nil)
+	a.SetRelay(h)
+	within(t, 3*time.Second, "no observe request", func() bool { return got.Load() > 0 })
+	for range 5 { // the relay again, at once: too soon
+		a.SetRelay(h)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := got.Load(); n != 1 {
+		t.Fatalf("%d requests within a second, want 1", n)
+	}
+	within(t, 3*time.Second, "the forced request that came too soon was lost", func() bool { return got.Load() == 2 })
+	time.Sleep(1500 * time.Millisecond)
+	if n := got.Load(); n != 2 {
+		t.Fatalf("%d requests, want 2", n)
+	}
+}

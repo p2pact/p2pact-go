@@ -20,6 +20,9 @@
 //	{"cmd":"relay","addr":"host:port","fp":"hex","ws":["wss://…"]} → {"ok":true}
 //	  uses a relay (TLS address and certificate fingerprint) and tells its WebSocket URLs in
 //	  the hints, so a browser can pair by our invite; say it before "invite"
+//	{"cmd":"advertise","hints":{"udp":["…"],"tcp":["…"]}}    → {"ok":true}
+//	  announces these addresses instead of our own (invites, hellos); the address our relay
+//	  sees us at still joins the UDP ones; "hints" absent or null — our own addresses again
 //	{"cmd":"close"}
 //
 // Kinds, named tools, grants, wants, the local socket and hosted tools (spec §1, §2, §8):
@@ -60,6 +63,7 @@
 //	{"cmd":"forward","a":"…","b":"…","on":true|false}         → {"ok":true}
 //	  opts in (or out) as a forwarder between two devices we trust
 //	{"cmd":"paths","peer":"…"}                                → {"paths":["udp","via:<forwarder>",…]}
+//	  the live roads to a known device (also "tcp", "relay:<address>", "local", "app:<name>")
 //	{"cmd":"forward-stats"}                                   → {"forwarded":N,"dropped":N}
 //
 // Errors: {"error":"…"}. Usage: p2pact-interop [data dir] [name]
@@ -196,6 +200,7 @@ func main() {
 			Wants, Grants           [][]any
 			A, B                    string
 			On                      bool
+			Hints                   *struct{ UDP, TCP []string }
 		}
 		if json.Unmarshal(in.Bytes(), &req) != nil {
 			say(map[string]string{"error": "bad json"})
@@ -299,6 +304,13 @@ func main() {
 		case "relay":
 			n.SetRelay(p2pact.RelayHint{Addr: req.Addr, FP: req.FP})
 			n.SetRelayWS(req.WS...)
+			say(map[string]bool{"ok": true})
+		case "advertise":
+			if req.Hints == nil {
+				n.SetAdvertise(nil)
+			} else {
+				n.SetAdvertise(&p2pact.Hints{UDP: req.Hints.UDP, TCP: req.Hints.TCP})
+			}
 			say(map[string]bool{"ok": true})
 		case "road":
 			cfg := p2pact.AppRoadConfig{Name: "ble", Stream: true, MTU: req.MTU, Rate: req.Rate}
