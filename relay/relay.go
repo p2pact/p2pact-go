@@ -14,6 +14,9 @@
 //	← {"ok":true}                                    or {"error":"…"} and close
 //	→ "p"                                            keepalive, answered with "P" (not forwarded)
 //	→ any other line                                 forwarded to the other side of the channel
+//
+// A first line with "op" instead of "channel" is a code slot request (slots.go): one answer,
+// then the relay closes.
 package relay
 
 import (
@@ -41,6 +44,7 @@ type hello struct {
 	Relay   int    `json:"relay"`
 	Channel string `json:"channel"`
 	Role    string `json:"role"`
+	Op      string `json:"op"` // a code slot request instead of a channel (slots.go)
 }
 
 type queued struct {
@@ -111,10 +115,13 @@ type Server struct {
 	perIP      map[string]int
 	trustProxy bool
 	now        func() time.Time
+	slots      *slots
 }
 
 func NewServer() *Server {
-	return &Server{channels: map[string]*channel{}, perIP: map[string]int{}, now: time.Now}
+	s := &Server{channels: map[string]*channel{}, perIP: map[string]int{}, now: time.Now}
+	s.slots = newSlots(func() time.Time { return s.now() })
+	return s
 }
 
 // Serve accepts connections until ln is closed (ln is already TLS).
@@ -180,6 +187,10 @@ func (s *Server) serve(c net.Conn) {
 		return
 	}
 	var h hello
+	if json.Unmarshal(line, &h) == nil && h.Relay == 1 && h.Op != "" {
+		s.serveSlot(c, ip, line)
+		return
+	}
 	if json.Unmarshal(line, &h) != nil || h.Relay != 1 || !validChannel(h.Channel) || (h.Role != "a" && h.Role != "b") {
 		_, _ = c.Write([]byte(`{"error":"bad hello"}` + "\n"))
 		return
