@@ -29,7 +29,7 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		c.SetReadLimit(wsMaxMessage)
-		wc := newWSConn(c, remoteHost(r))
+		wc := newWSConn(c, s.clientHost(r))
 		s.serve(wc) // closes the connection
 	})
 }
@@ -43,6 +43,31 @@ func (s *Server) ServeWS(ln net.Listener) error {
 		return nil
 	}
 	return err
+}
+
+// TrustProxy makes the WebSocket handler take the client address from X-Forwarded-For (last
+// entry, as a trusted proxy appends it) or X-Real-IP, but only when the TCP peer is loopback.
+// Use it behind a local reverse proxy; the proxy must overwrite client-supplied values.
+func (s *Server) TrustProxy() { s.trustProxy = true }
+
+func (s *Server) clientHost(r *http.Request) string {
+	peer := remoteHost(r)
+	if !s.trustProxy {
+		return peer
+	}
+	if ip := net.ParseIP(peer); ip == nil || !ip.IsLoopback() {
+		return peer
+	}
+	if xs := r.Header.Values("X-Forwarded-For"); len(xs) > 0 {
+		parts := strings.Split(xs[len(xs)-1], ",")
+		if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
+			return ip.String()
+		}
+	}
+	if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
+		return ip.String()
+	}
+	return peer
 }
 
 func remoteHost(r *http.Request) string {

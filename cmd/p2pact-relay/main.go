@@ -42,6 +42,7 @@ func main() {
 	wsHost := flag.String("ws-host", "", "public host name of the WebSocket relay: a Let's Encrypt certificate is obtained for it")
 	wsCert := flag.String("ws-cert", "", "certificate chain (PEM) for wss")
 	wsKey := flag.String("ws-key", "", "private key (PEM) for wss")
+	wsTrustProxy := flag.Bool("ws-trust-proxy", false, "behind a local reverse proxy: take the client address from X-Forwarded-For / X-Real-IP when the WebSocket peer is loopback")
 	flag.Parse()
 
 	cert, err := relay.LoadOrMakeCert(filepath.Join(*data, "cert.pem"), filepath.Join(*data, "key.pem"))
@@ -54,6 +55,9 @@ func main() {
 		return
 	}
 	srv := relay.NewServer()
+	if *wsTrustProxy {
+		srv.TrustProxy()
+	}
 
 	if *wsHost != "" && *wsAddr == "" {
 		*wsAddr = ":443"

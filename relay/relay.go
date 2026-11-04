@@ -106,10 +106,11 @@ func (ch *channel) prune(now time.Time) {
 
 // Server is a relay. Channels live in memory; after a restart devices reconnect by themselves.
 type Server struct {
-	mu       sync.Mutex
-	channels map[string]*channel
-	perIP    map[string]int
-	now      func() time.Time
+	mu         sync.Mutex
+	channels   map[string]*channel
+	perIP      map[string]int
+	trustProxy bool
+	now        func() time.Time
 }
 
 func NewServer() *Server {

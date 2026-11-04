@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -139,3 +141,85 @@ func TestIsLoopbackAddr(t *testing.T) {
 		}
 	}
 }
+
+func xffDial(t *testing.T, url, xff string) (*websocket.Conn, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: http.Header{"X-Forwarded-For": {xff}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.CloseNow() })
+	xffSeq++
+	wsSend(t, c, fmt.Sprintf(`{"relay":1,"channel":"%032x","role":"a"}`, xffSeq))
+	return c, wsRecv(t, c)
+}
+
+// Behind a loopback proxy with TrustProxy, limits are counted per forwarded address.
+func TestWSTrustProxyLimitsPerRealIP(t *testing.T) {
+	srv := NewServer()
+	srv.TrustProxy()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http")
+	for i := 0; i < maxPerIP; i++ {
+		if _, got := xffDial(t, url, "203.0.113.7"); got != `{"ok":true}` {
+			t.Fatalf("conn %d: %q", i, got)
+		}
+	}
+	if _, got := xffDial(t, url, "203.0.113.7"); !strings.Contains(got, "too many") {
+		t.Fatalf("same real IP over the limit: %q", got)
+	}
+	if _, got := xffDial(t, url, "198.51.100.9"); got != `{"ok":true}` {
+		t.Fatalf("other real IP: %q", got)
+	}
+}
+
+// Without TrustProxy the header is ignored: every guest is the peer address.
+func TestWSNoTrustProxyIgnoresHeader(t *testing.T) {
+	ts := httptest.NewServer(NewServer().Handler())
+	defer ts.Close()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http")
+	for i := 0; i < maxPerIP; i++ {
+		xffDial(t, url, "203.0.113."+string(rune('1'+i%9)))
+	}
+	if _, got := xffDial(t, url, "198.51.100.9"); !strings.Contains(got, "too many") {
+		t.Fatalf("header must be ignored: %q", got)
+	}
+}
+
+func TestClientHost(t *testing.T) {
+	trust := &Server{trustProxy: true}
+	plain := &Server{}
+	mk := func(remote, xff, real string) *http.Request {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = remote
+		if xff != "" {
+			r.Header.Set("X-Forwarded-For", xff)
+		}
+		if real != "" {
+			r.Header.Set("X-Real-IP", real)
+		}
+		return r
+	}
+	cases := []struct {
+		s    *Server
+		r    *http.Request
+		want string
+	}{
+		{trust, mk("127.0.0.1:5", "203.0.113.7", ""), "203.0.113.7"},
+		{trust, mk("[::1]:5", "1.1.1.1, 203.0.113.7", ""), "203.0.113.7"},
+		{trust, mk("127.0.0.1:5", "", "203.0.113.8"), "203.0.113.8"},
+		{trust, mk("127.0.0.1:5", "garbage", ""), "127.0.0.1"},
+		{trust, mk("192.0.2.1:5", "203.0.113.7", "203.0.113.8"), "192.0.2.1"},
+		{plain, mk("127.0.0.1:5", "203.0.113.7", ""), "127.0.0.1"},
+	}
+	for i, c := range cases {
+		if got := c.s.clientHost(c.r); got != c.want {
+			t.Errorf("case %d: got %q want %q", i, got, c.want)
+		}
+	}
+}
+
+var xffSeq int
