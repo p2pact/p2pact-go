@@ -209,8 +209,10 @@ type Node struct {
 	inviteGrants map[string][]Grant
 	// inviteAsk: invites made with InviteAsk (their newcomers go to OnAsk)
 	inviteAsk map[string]bool
-	peers     map[string]*peerState
-	handlers  map[[2]int]Handler
+	// inviteStore: the invites are kept on disk (EnableInviteStore)
+	inviteStore bool
+	peers       map[string]*peerState
+	handlers    map[[2]int]Handler
 	// grants (grants.go): methods that check the level themselves, methods marked read
 	levelHandlers map[[2]int]LevelHandler
 	readMethods   map[[2]int]bool
@@ -322,6 +324,11 @@ func (n *Node) UDP() *UDPRoad { return n.udp }
 func (n *Node) SetRelay(h RelayHint) {
 	n.mu.Lock()
 	n.own = &h
+	if !n.paused { // the invites that came back from the store (EnableInviteStore) wait here too
+		for id := range n.invites {
+			n.relayLocked(h).join(id, "a")
+		}
+	}
 	n.mu.Unlock()
 }
 
@@ -463,11 +470,19 @@ func (n *Node) Handle(tool, method int, h Handler) {
 func (n *Node) Invite(ttl time.Duration) *Invite {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	return n.inviteLocked(ttl, false)
+}
+
+func (n *Node) inviteLocked(ttl time.Duration, ask bool) *Invite {
 	inv := &Invite{Key: n.ID.Key.Public, Name: n.Name, Secret: randBytes(32), Exp: time.Now().Add(ttl), Hints: n.hintsLocked()}
 	n.invites[hexs(inv.ID())] = inv
+	if ask {
+		n.inviteAsk[hexs(inv.ID())] = true
+	}
 	if n.own != nil && !n.paused { // paused: joined on resume
 		n.relayLocked(*n.own).join(hexs(inv.ID()), "a")
 	}
+	n.saveInvitesLocked()
 	return inv
 }
 
@@ -475,11 +490,9 @@ func (n *Node) Invite(ttl time.Duration) *Invite {
 // pairs by it goes to [Node.OnAsk] (spec §2, "Permissions asked"); other invites are
 // unaffected.
 func (n *Node) InviteAsk(ttl time.Duration) *Invite {
-	inv := n.Invite(ttl)
 	n.mu.Lock()
-	n.inviteAsk[hexs(inv.ID())] = true
-	n.mu.Unlock()
-	return inv
+	defer n.mu.Unlock()
+	return n.inviteLocked(ttl, true)
 }
 
 // Join pairs using an invite, trying all its hints until one answers.
@@ -1100,6 +1113,7 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	}
 	delete(n.hs, local)
 	delete(n.invites, hexs(h.invite.ID())) // single use
+	n.saveInvitesLocked()
 	if n.own != nil {
 		n.relayLocked(*n.own).leave(hexs(h.invite.ID()))
 	}
@@ -1728,13 +1742,19 @@ func (n *Node) maintainLocked(now time.Time) {
 			delete(n.hs, idx)
 		}
 	}
+	pruned := false
 	for id, inv := range n.invites {
 		if now.After(inv.Exp) {
 			delete(n.invites, id)
+			delete(n.inviteAsk, id)
+			pruned = true
 			if n.own != nil {
 				n.relayLocked(*n.own).leave(id)
 			}
 		}
+	}
+	if pruned {
+		n.saveInvitesLocked()
 	}
 }
 
