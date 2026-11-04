@@ -3,6 +3,7 @@ package p2pact
 import (
 	"bytes"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -222,5 +223,102 @@ func TestHeldDropped(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("held messages were never dropped")
+	}
+}
+
+// The sender lists more dictionaries than the receiver keeps of one kind (a common one the
+// receiver lacks plus four of its own for the receiver: all five are the pair's on the
+// receiver). The receiver must keep what the sender lists instead of evicting one for another
+// and fetching it back forever, and messages compressed meanwhile must all run.
+func TestListedDictsKept(t *testing.T) {
+	a, b := node(t, "Engine", true, nil), node(t, "CLI", true, nil)
+	defer a.Close()
+	defer b.Close()
+	var asked atomic.Int64
+	a.Handle(0, 5, func(peer string, args []cbor.RawMessage) ([]any, error) {
+		asked.Add(1)
+		return a.dictHandler(peer, args)
+	})
+	pair(t, a, b)
+	got := make(chan string, 64)
+	b.mu.Lock()
+	b.OnEvent = func(_ string, _, _ int, args []cbor.RawMessage) {
+		var s string
+		_ = cbor.Unmarshal(args[0], &s)
+		got <- s
+	}
+	b.mu.Unlock()
+	a.mu.Lock()
+	common, _ := NewDict(testDict(t, 0))
+	_ = a.addDictLocked(common)
+	for seed := 1; seed <= dictKeep; seed++ {
+		d, _ := NewDict(testDict(t, seed))
+		d.peer, d.own = b.ID.Addr(), true
+		_ = a.addDictLocked(d)
+	}
+	a.mu.Unlock()
+	for i := range 20 {
+		_ = a.Event(b.ID.Addr(), 9, 1, fmt.Sprintf("%d %s", i, longText))
+	}
+	time.Sleep(2 * time.Second)
+	if n := asked.Load(); n > 2*(dictKeep+1) {
+		t.Fatalf("b asked for dictionaries %d times: it evicts what a still lists", n)
+	}
+	b.mu.Lock()
+	held := len(b.peers[a.ID.Addr()].waiting)
+	b.mu.Unlock()
+	if held > 0 {
+		t.Fatalf("%d messages still held", held)
+	}
+	if n := len(b.Dicts(a.ID.Addr())); n != dictKeep+1 {
+		t.Fatalf("b keeps %d of a's %d dictionaries", n, dictKeep+1)
+	}
+	for i := range 20 {
+		select {
+		case <-got:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("got %d of 20 messages", i)
+		}
+	}
+}
+
+// A message waits for a dictionary the sender cannot give: it is not dropped silently at the
+// first failed fetch, but held, asked for again and dropped after holdDrop with OnHeld.
+func TestHeldDictUnreachable(t *testing.T) {
+	oldAsk, oldDrop := holdAsk, holdDrop
+	holdAsk, holdDrop = 200*time.Millisecond, 1500*time.Millisecond
+	defer func() { holdAsk, holdDrop = oldAsk, oldDrop }()
+	a, b := node(t, "Phone", true, nil), node(t, "Mac", true, nil)
+	defer a.Close()
+	defer b.Close()
+	pair(t, a, b)
+	raw := testDict(t, 0)
+	_ = a.AddDict(raw)
+	_ = b.AddDict(raw)
+	waitDicts(t, a, b, 1)
+	waitDicts(t, b, a, 1)
+	var asked atomic.Int64
+	a.Handle(0, 5, func(string, []cbor.RawMessage) ([]any, error) {
+		asked.Add(1)
+		return nil, &Error{Code: ErrNotFound, Text: "no such dictionary"}
+	})
+	held := make(chan int, 1)
+	start := time.Now()
+	b.mu.Lock()
+	b.OnHeld = func(_ string, k int) { held <- k }
+	b.dicts.dicts = nil // b lost the dictionary and a does not know
+	b.dicts.gen++
+	b.mu.Unlock()
+	_ = a.Event(b.ID.Addr(), 9, 1, string(longText))
+	select {
+	case k := <-held:
+		if k < 1 || time.Since(start) < holdAsk {
+			t.Fatalf("held %d, dropped after %v", k, time.Since(start))
+		}
+		if asked.Load() < 2 {
+			t.Fatalf("asked for the dictionary %d times: not asked again before dropping", asked.Load())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the held message was dropped silently or never")
 	}
 }

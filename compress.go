@@ -28,6 +28,12 @@ const zipFastFrom = 32 << 10
 // a device's own): new ones and those still in flight.
 const dictKeep = 4
 
+// dictListedMax bounds the pair's dictionaries kept because the device still lists them: what
+// a device may list to another — its common ones, its own for it and the one it got from it.
+// Everything we fetch from a device is the pair's here, so its list can hold more than dictKeep
+// of that kind; evicting one it lists would only make us fetch it again, and again (spec §5).
+const dictListedMax = 3 * dictKeep
+
 var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
 
 // Dict is a compression dictionary; its id is the first 16 bytes of BLAKE2s of its bytes.
@@ -209,6 +215,9 @@ type dictStore struct {
 	// list); a dropped one leaves an empty id, and a new one goes to the end.
 	slots map[string][][]byte
 	gen   int                // bumped on every change of the dictionaries
+	// listedBy reports whether the device a pair's dictionary came from still lists it to us
+	// (nil — none is): such a one is kept past dictKeep, up to dictListedMax.
+	listedBy func(d *Dict) bool
 	cache map[string]slotsAt // ids by device, as of gen
 }
 
@@ -273,10 +282,11 @@ func (s *dictStore) add(d *Dict) error {
 			continue
 		}
 		k := [2]any{x.peer, x.own}
-		if kinds[k]++; kinds[k] > dictKeep {
+		if kept := kinds[k]; kept >= dictKeep && !(kept < dictListedMax && x.peer != "" && !x.own && s.listedBy != nil && s.listedBy(x)) {
 			dropped = append(dropped, x)
 			continue
 		}
+		kinds[k]++
 		out = append(out, x)
 	}
 	for _, x := range dropped {

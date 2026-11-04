@@ -170,8 +170,8 @@ type Node struct {
 	OnGranted func(peer string, grants []Grant)
 	// OnHello is called when a known device sends its hello (new session or pairing).
 	OnHello func(peer string)
-	// OnHeld is called when messages from a device waited too long for a dictionary or its list
-	// and were dropped (held — how many): the application can tell the user or resend.
+	// OnHeld is called when messages from a device waited too long for a dictionary or its list,
+	// or were compressed with a dictionary the sender has dropped since, and were dropped (held — how many): the application can tell the user or resend.
 	OnHeld func(peer string, held int)
 	// NoCompression turns compression off for what we send (benchmarks, debugging).
 	NoCompression bool
@@ -244,6 +244,10 @@ func NewNode(dir, name string) (*Node, error) {
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
 	n.Handle(0, 2, func(peer string, _ []cbor.RawMessage) ([]any, error) { return n.info(peer), nil })
 	n.Handle(0, 5, n.dictHandler)
+	n.dicts.listedBy = func(d *Dict) bool { // under n.mu, as every change of the store
+		ps := n.peers[d.peer]
+		return ps != nil && has(ps.dicts, d.ID)
+	}
 	n.Handle(0, 6, n.grantsHandler)
 	return n, nil
 }
@@ -1853,10 +1857,15 @@ func (n *Node) drainLocked(peer string, ps *peerState) {
 		switch {
 		case errors.Is(err, errNoDict):
 			if id := ps.dicts[int(w.msg[0])-1]; len(id) > 0 {
-				n.fetchDictLocked(peer, ps, id, true)
+				if !has(ps.tried, id) { // one we could not get: unholdLocked asks again, then drops
+					n.fetchDictLocked(peer, ps, id)
+				}
 				return
-			} // a free slot: the message is damaged
+			} // a free slot: the sender dropped that dictionary, the message cannot be read
 			ps.waiting = ps.waiting[1:]
+			if on := n.OnHeld; on != nil {
+				go on(peer, 1)
+			}
 			continue
 		case errors.Is(err, errNoList):
 			// a sender of an older version compresses its hello too: then we would wait for it
@@ -1968,7 +1977,7 @@ func outOfOrder(msg []byte) bool {
 func (n *Node) fetchNewLocked(peer string, ps *peerState) {
 	for _, id := range ps.dicts {
 		if len(id) > 0 && n.dicts.get(id, peer) == nil && !has(ps.tried, id) {
-			n.fetchDictLocked(peer, ps, id, false)
+			n.fetchDictLocked(peer, ps, id)
 			return
 		}
 	}
@@ -1976,7 +1985,7 @@ func (n *Node) fetchNewLocked(peer string, ps *peerState) {
 
 // fetchDictLocked asks the device for dictionary id: one it compressed a waiting message
 // with (it has it), or a new one in its list. What we get belongs to the pair with it.
-func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte, waiting bool) {
+func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte) {
 	if ps.fetching {
 		return
 	}
@@ -2002,11 +2011,9 @@ func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte, waiting bo
 				d = nil
 			}
 		}
-		switch {
-		case d != nil:
-		case waiting && len(ps.waiting) > 0:
-			ps.waiting = ps.waiting[1:] // the dictionary is unreachable: this message is lost
-		default:
+		if d == nil {
+			// not dropped at once even if a message waits for it: it stays held, unholdLocked asks
+			// again after holdAsk and drops it after holdDrop, telling the application (OnHeld)
 			ps.tried = append(ps.tried, id)
 		}
 		n.drainLocked(peer, ps)
