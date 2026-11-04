@@ -45,6 +45,7 @@ type UDPRoad struct {
 	free        time.Time // when the emulated link is free again
 
 	sentBytes, sentPackets atomic.Int64
+	publicAt, primedAt     time.Time // the last datagram to a public IPv4 address, the last prime (see prime)
 	recvBytes, recvPackets atomic.Int64
 }
 
@@ -119,8 +120,9 @@ func (u *UDPRoad) Send(addr string, pkt []byte) error {
 		u.addr[addr] = a
 		u.mu.Unlock()
 	}
-	if delay, rate := time.Duration(u.delay.Load()), u.rate.Load(); delay > 0 || rate > 0 {
-		wait := delay
+	primed := u.prime(a)
+	if delay, rate := time.Duration(u.delay.Load()), u.rate.Load(); delay > 0 || rate > 0 || primed > 0 {
+		wait := delay + primed
 		if rate > 0 {
 			u.mu.Lock()
 			now := time.Now()
@@ -137,6 +139,56 @@ func (u *UDPRoad) Send(addr string, pkt []byte) error {
 	}
 	_, err := u.conn.WriteToUDP(pkt, a)
 	return err
+}
+
+// primeIdle: after this long without a datagram to a public address the NAT may have dropped
+// our mapping, and the next one primes it again (carrier NATs keep UDP mappings 30 s or more).
+// primeGap: datagrams to public addresses wait this long behind a prime — a NAT takes a moment
+// to apply it, and a flow that overtakes it gets a port of its own. primePort is the STUN port
+// (RFC 8489), the port a NAT is primed on; primeHost says the NAT is on the way to an address.
+// Tests change them.
+var (
+	primeIdle = 20 * time.Second
+	primeGap  = 50 * time.Millisecond
+	primePort = 3478
+	primeHost = natPublic
+)
+
+// prime goes before a datagram to a public IPv4 address when none went to one for primeIdle
+// (spec §7): one byte to port 3478 of the same host. Carrier NATs give a socket one mapping for
+// all destinations (endpoint-independent, what punching needs) only once it has talked to the
+// STUN port — operators keep WebRTC working that way; before that, every destination gets its
+// own port, and the address our relay sees is not the one our devices see. A flow opened before
+// keeps its own port, so the byte goes first and the datagram waits primeGap behind it (the
+// result: how long to wait). Nothing answers it; a one-byte packet is dropped by every P2PACT
+// receiver.
+func (u *UDPRoad) prime(a *net.UDPAddr) time.Duration {
+	if !primeHost(a.IP) {
+		return 0
+	}
+	u.mu.Lock()
+	now := time.Now()
+	idle := now.Sub(u.publicAt) >= primeIdle
+	u.publicAt = now
+	if idle {
+		u.primedAt = now
+	}
+	wait := u.primedAt.Add(primeGap).Sub(now)
+	u.mu.Unlock()
+	if idle {
+		_, _ = u.conn.WriteToUDP([]byte{0}, &net.UDPAddr{IP: a.IP, Port: primePort})
+	}
+	return max(wait, 0)
+}
+
+// natPublic: a public IPv4 address, reached through a NAT (not a private, carrier-grade NAT,
+// loopback or link-local one).
+func natPublic(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil || !ip4.IsGlobalUnicast() || ip4.IsPrivate() || ip4[0] == 0 || ip4[0] >= 240 {
+		return false
+	}
+	return !(ip4[0] == 100 && ip4[1]&0xc0 == 64) // 100.64.0.0/10
 }
 
 func (u *UDPRoad) run(recv func([]byte, Endpoint)) {

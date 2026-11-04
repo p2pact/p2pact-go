@@ -281,3 +281,112 @@ func TestObserveForcedOncePerSecond(t *testing.T) {
 		t.Fatalf("%d requests, want 2", n)
 	}
 }
+
+// TestPrime: before a datagram to a public address, after primeIdle without one, one byte goes to
+// port 3478 of the same host (spec §7); private, carrier-grade NAT and loopback addresses are not
+// primed.
+func TestPrime(t *testing.T) {
+	for _, c := range []struct {
+		ip     string
+		public bool
+	}{
+		{"178.88.48.86", true}, {"161.35.71.42", true}, {"::ffff:8.8.8.8", true},
+		{"10.1.2.3", false}, {"192.168.31.178", false}, {"172.16.0.1", false},
+		{"100.94.117.6", false}, {"127.0.0.1", false}, {"169.254.1.1", false},
+		{"2001:db8::1", false}, {"0.0.0.0", false},
+	} {
+		if got := natPublic(net.ParseIP(c.ip)); got != c.public {
+			t.Errorf("natPublic(%s) = %v", c.ip, got)
+		}
+	}
+
+	stun, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stun.Close()
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	oldIdle, oldGap, oldPort, oldHost := primeIdle, primeGap, primePort, primeHost
+	primeIdle, primeGap = 600*time.Millisecond, 150*time.Millisecond
+	primePort, primeHost = stun.LocalAddr().(*net.UDPAddr).Port, func(net.IP) bool { return true }
+	defer func() { primeIdle, primeGap, primePort, primeHost = oldIdle, oldGap, oldPort, oldHost }()
+
+	u, err := listenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.close()
+	primes := func() int {
+		n := 0
+		buf := make([]byte, 64)
+		for {
+			_ = stun.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			k, from, err := stun.ReadFromUDP(buf)
+			if err != nil {
+				return n
+			}
+			if k != 1 || from.Port != u.conn.LocalAddr().(*net.UDPAddr).Port {
+				t.Fatalf("prime: %d bytes from %v", k, from)
+			}
+			n++
+		}
+	}
+	// got reads what the peer received, each with how long after start it came
+	got := func(want int, start time.Time) map[string]time.Duration {
+		out := map[string]time.Duration{}
+		buf := make([]byte, 64)
+		for len(out) < want {
+			_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+			k, _, err := peer.ReadFromUDP(buf)
+			if err != nil {
+				t.Fatalf("received %v, want %d datagrams", out, want)
+			}
+			out[string(buf[:k])] = time.Since(start)
+		}
+		return out
+	}
+	to := peer.LocalAddr().String()
+
+	start := time.Now()
+	_ = u.Send(to, []byte("first"))
+	_ = u.Send(to, []byte("second"))
+	if n := primes(); n != 1 {
+		t.Fatalf("first datagrams: %d primes, want 1", n)
+	}
+	for m, at := range got(2, start) {
+		if at < primeGap-10*time.Millisecond {
+			t.Fatalf("%q came %v after the prime, want it to wait %v", m, at, primeGap)
+		}
+	}
+
+	start = time.Now()
+	_ = u.Send(to, []byte("third"))
+	if at := got(1, start)["third"]; at >= primeGap-10*time.Millisecond {
+		t.Fatalf("a datagram after the gap waited %v", at)
+	}
+	if n := primes(); n != 0 {
+		t.Fatalf("a datagram right after: %d primes, want 0", n)
+	}
+
+	time.Sleep(primeIdle + 50*time.Millisecond)
+	_ = u.Send(to, []byte("after idle"))
+	got(1, time.Now())
+	if n := primes(); n != 1 {
+		t.Fatalf("after primeIdle: %d primes, want 1", n)
+	}
+
+	primeHost = func(net.IP) bool { return false }
+	time.Sleep(primeIdle + 50*time.Millisecond)
+	start = time.Now()
+	_ = u.Send(to, []byte("private"))
+	if at := got(1, start)["private"]; at >= primeGap-10*time.Millisecond {
+		t.Fatalf("a datagram to a private address waited %v", at)
+	}
+	if n := primes(); n != 0 {
+		t.Fatalf("a private address: %d primes, want 0", n)
+	}
+}
