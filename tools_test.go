@@ -145,3 +145,218 @@ func TestHandleToolAll(t *testing.T) {
 	a.UnregisterTool("com.acme.host")
 	eventually(t, "gone from hello", func() bool { return len(b.PeerTools(a.ID.Addr())) == 0 })
 }
+
+// A tool of the spec served by the application: "p2pact.term" with one handler under its fixed
+// number 5, announced in {tool: version}; the node checks read, the handler the rest; it leaves
+// the hello when taken back; its name stays the spec's (RegisterTool refuses it).
+func TestFixedToolServedByApp(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	if num, ok := FixedTool("p2pact.term"); !ok || num != 5 {
+		t.Fatalf("p2pact.term: %d %v", num, ok)
+	}
+	if _, err := a.RegisterTool("p2pact.term", 1); err == nil {
+		t.Fatal("a name of the spec was registered as a named tool")
+	}
+	pair(t, a, b)
+	addr, me := a.ID.Addr(), b.ID.Addr()
+	err := a.HandleToolAll("p2pact.term", func(_ string, level, method int, _ []cbor.RawMessage) ([]any, error) {
+		if method != 1 && level < LevelWrite {
+			return nil, &Error{Code: ErrForbidden, Text: "read only"}
+		}
+		return []any{"term", method}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "term in the hello", func() bool { return b.PeerHasTool(addr, "p2pact.term") })
+	if got := b.PeerTools(addr); len(got) != 0 {
+		t.Fatalf("a tool of the spec went into the named map: %v", got)
+	}
+	if num, called, ok := b.ResolveTool(addr, "p2pact.term"); !ok || num != 5 || called != "p2pact.term" {
+		t.Fatalf("resolve: %d %q %v", num, called, ok)
+	}
+	call := func(m int) error {
+		res, err := b.CallTool(ctx5(t), addr, "p2pact.term", m)
+		var s string
+		if err == nil && (len(res) != 2 || cbor.Unmarshal(res[0], &s) != nil || s != "term") {
+			t.Fatalf("result %v", res)
+		}
+		return err
+	}
+	if err := call(1); err != nil {
+		t.Fatal(err)
+	}
+	_ = a.SetGrants(me, []Grant{{"p2pact.term", LevelRead}})
+	if err := call(1); err != nil {
+		t.Errorf("read: %v", err)
+	}
+	if callCode(call(2)) != ErrForbidden {
+		t.Error("write at read")
+	}
+	_ = a.SetGrants(me, []Grant{{"p2pact.chat", LevelWrite}})
+	if callCode(call(1)) != ErrForbidden {
+		t.Error("no grant on term")
+	}
+	a.UnregisterTool("p2pact.term")
+	eventually(t, "term gone from the hello", func() bool { return !b.PeerHasTool(addr, "p2pact.term") })
+}
+
+// An alias (spec §8.1): one tool under the spec's name and a former one. Grants on either name
+// count for both — the highest level wins — for calls and for events; each name answers under
+// its own number.
+func TestAliasRights(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	defer b.Close()
+	if err := a.AliasTool("p2pact.chat", "p2pact.term"); err == nil {
+		t.Fatal("a name of the spec taken as an alias")
+	}
+	if err := a.AliasTool("com.example.term", "com.example.term"); err == nil {
+		t.Fatal("a tool its own alias")
+	}
+	if err := a.AliasTool("com.example.term", "p2pact.term"); err != nil {
+		t.Fatal(err)
+	}
+	served := func(name string) ToolHandler {
+		return func(_ string, level, method int, _ []cbor.RawMessage) ([]any, error) {
+			if method != 1 && level < LevelWrite {
+				return nil, &Error{Code: ErrForbidden, Text: "read only"}
+			}
+			return []any{name}, nil
+		}
+	}
+	if err := a.HandleToolAll("p2pact.term", served("p2pact.term")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.HandleToolAll("com.example.term", served("com.example.term")); err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan int, 8)
+	b.mu.Lock()
+	b.OnEvent = func(_ string, tool, _ int, _ []cbor.RawMessage) { events <- tool }
+	b.mu.Unlock()
+	pair(t, a, b)
+	addr, me := a.ID.Addr(), b.ID.Addr()
+	eventually(t, "both names", func() bool {
+		return b.PeerHasTool(addr, "p2pact.term") && b.PeerHasTool(addr, "com.example.term")
+	})
+	alias, _ := b.ToolNumber(addr, "com.example.term")
+	call := func(name string, m int) error {
+		res, err := b.CallTool(ctx5(t), addr, name, m)
+		var s string
+		if err == nil && (len(res) != 1 || cbor.Unmarshal(res[0], &s) != nil || s != name) {
+			t.Fatalf("%s answered %q", name, s)
+		}
+		return err
+	}
+	for _, c := range []struct {
+		grants []Grant
+		level  int
+	}{
+		{[]Grant{{"com.example.term", LevelWrite}}, LevelWrite},
+		{[]Grant{{"p2pact.term", LevelWrite}}, LevelWrite},
+		{[]Grant{{"p2pact.term", LevelRead}, {"com.example.term", LevelWrite}}, LevelWrite},
+		{[]Grant{{"com.example.term", LevelRead}}, LevelRead},
+		{[]Grant{{"p2pact.chat", LevelWrite}}, 0},
+	} {
+		_ = a.SetGrants(me, c.grants)
+		for _, name := range []string{"p2pact.term", "com.example.term"} {
+			if got := a.Level(me, name); got != c.level {
+				t.Fatalf("%v: level on %s %d, want %d", c.grants, name, got, c.level)
+			}
+			if err := call(name, 1); (err == nil) != (c.level >= LevelRead) {
+				t.Fatalf("%v: read on %s: %v", c.grants, name, err)
+			}
+			if err := call(name, 2); (err == nil) != (c.level >= LevelWrite) {
+				t.Fatalf("%v: write on %s: %v", c.grants, name, err)
+			}
+		}
+		// events of either number reach a device with read on either name
+		_ = a.Event(me, 5, 3)
+		_ = a.Event(me, alias, 3)
+		var got []int
+		for wait := time.After(time.Second); len(got) < 2; {
+			select {
+			case tool := <-events:
+				got = append(got, tool)
+				continue
+			case <-wait:
+			}
+			break
+		}
+		if want := c.level >= LevelRead; (len(got) == 2) != want || (want && (got[0] != 5 || got[1] != alias)) {
+			t.Fatalf("%v: events %v", c.grants, got)
+		}
+	}
+}
+
+// A device that knows the terminal only by its former name and one that serves p2pact.term
+// talk both ways: a new caller reaches the old device by the alias, an old caller reaches the
+// new device by the former name with grants on p2pact.term, a new one goes to 5.
+func TestAliasOldAndNewDevices(t *testing.T) {
+	old, nw, phone := node(t, "Old", true, nil), node(t, "New", true, nil), node(t, "Phone", true, nil)
+	defer old.Close()
+	defer nw.Close()
+	defer phone.Close()
+	answer := func(who string) ToolHandler {
+		return func(string, int, int, []cbor.RawMessage) ([]any, error) { return []any{who}, nil }
+	}
+	if err := old.HandleToolAll("com.example.term", answer("old")); err != nil { // before p2pact.term
+		t.Fatal(err)
+	}
+	if err := nw.AliasTool("com.example.term", "p2pact.term"); err != nil {
+		t.Fatal(err)
+	}
+	if err := nw.HandleToolAll("p2pact.term", answer("new:5")); err != nil {
+		t.Fatal(err)
+	}
+	if err := nw.HandleToolAll("com.example.term", answer("new:alias")); err != nil {
+		t.Fatal(err)
+	}
+	if err := phone.AliasTool("com.example.term", "p2pact.term"); err != nil { // a new caller
+		t.Fatal(err)
+	}
+	pair(t, nw, old)
+	pair(t, phone, old)
+	pair(t, phone, nw)
+	oldAddr, nwAddr, phoneAddr := old.ID.Addr(), nw.ID.Addr(), phone.ID.Addr()
+	eventually(t, "hellos", func() bool {
+		return phone.PeerHasTool(oldAddr, "com.example.term") && phone.PeerHasTool(nwAddr, "p2pact.term") &&
+			old.PeerHasTool(nwAddr, "com.example.term") && nw.PeerHasTool(oldAddr, "com.example.term")
+	})
+	if phone.PeerHasTool(oldAddr, "p2pact.term") {
+		t.Fatal("the old device announced 5")
+	}
+	if num, called, ok := phone.ResolveTool(oldAddr, "p2pact.term"); !ok || num < FirstNamedTool || called != "com.example.term" {
+		t.Fatalf("new -> old: %d %q %v", num, called, ok)
+	}
+	if num, called, ok := phone.ResolveTool(nwAddr, "p2pact.term"); !ok || num != 5 || called != "p2pact.term" {
+		t.Fatalf("new -> new: %d %q %v", num, called, ok)
+	}
+	if num, called, ok := phone.ResolveTool(nwAddr, "com.example.term"); !ok || num < FirstNamedTool || called != "com.example.term" {
+		t.Fatalf("by the alias itself: %d %q %v", num, called, ok)
+	}
+	_ = nw.SetGrants(oldAddr, []Grant{{"p2pact.term", LevelWrite}}) // an old caller, granted the new name
+	for _, c := range []struct {
+		from     *Node
+		to, name string
+		want     string
+	}{
+		{phone, oldAddr, "p2pact.term", "old"},
+		{phone, nwAddr, "p2pact.term", "new:5"},
+		{nw, oldAddr, "p2pact.term", "old"},
+		{old, nwAddr, "com.example.term", "new:alias"},
+	} {
+		res, err := c.from.CallTool(ctx5(t), c.to, c.name, 1)
+		var s string
+		if err != nil || len(res) != 1 || cbor.Unmarshal(res[0], &s) != nil || s != c.want {
+			t.Fatalf("%s -> %s %s: %q %v", c.from.Name, c.to, c.name, s, err)
+		}
+	}
+	// without the alias declared, the old device has no p2pact.term to a caller
+	if _, err := old.CallTool(ctx5(t), phoneAddr, "com.example.none", 1); callCode(err) != ErrNoMethod {
+		t.Fatalf("unknown tool: %v", err)
+	}
+}

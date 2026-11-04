@@ -27,6 +27,10 @@ const (
 	ToolChat    = "p2pact.chat"
 	ToolFleet   = "p2pact.fleet"
 	ToolPlugins = "p2pact.plugins"
+	// ToolTerm is the terminal (tool 5, spec term.md); the SDK has no typed client for it: call it
+	// with [Computer.CallTool]. A computer that knows it by a former name still answers once
+	// the alias is declared: Node().AliasTool(former, ToolTerm).
+	ToolTerm = "p2pact.term"
 
 	numChat    = 1
 	numFleet   = 2

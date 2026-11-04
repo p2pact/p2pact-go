@@ -131,6 +131,7 @@ type peerState struct {
 	askedInfo  time.Time
 	tried      [][]byte           // dictionaries of its list we asked it for and did not get
 	named      map[string]toolRef // its named tools, from its hello (spec §8)
+	fixed      map[int]int        // its tools of the spec, {tool: version} from its hello; nil — no hello yet
 	hist       *history           // what we sent it and got from it, to train our dictionary for it
 	sysCalls   map[uint64]bool    // our calls of tool 0: their results are not conversation
 	queue      []pending          // conversation messages waiting to be learnt (learn.go)
@@ -247,8 +248,10 @@ type Node struct {
 	names    map[string]int
 	numbers  map[int]string
 	versions map[int]int
-	resetAt  map[string]time.Time
-	dicts    *dictStore
+	// aliases (AliasTool): a former name → the tool's name now; grants on either count for both
+	aliases map[string]string
+	resetAt map[string]time.Time
+	dicts   *dictStore
 
 	stop  chan struct{}
 	kick  chan struct{} // something was queued: send now, not on the next tick
@@ -272,7 +275,7 @@ func NewNode(dir, name string) (*Node, error) {
 	n := &Node{ID: id, Trust: LoadTrust(dir), Name: name, dir: dir, boot: binary.BigEndian.Uint32(randBytes(4)),
 		rel: map[string]*RelayRoad{}, apps: map[*AttachedRoad]bool{}, sessions: map[uint32]*session{}, current: map[string]*session{},
 		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, inviteGrants: map[string][]Grant{}, inviteAsk: map[string]bool{}, peers: map[string]*peerState{},
-		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, toolHandlers: map[int]ToolHandler{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
+		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, toolHandlers: map[int]ToolHandler{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, aliases: map[string]string{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
 		kick: make(chan struct{}, 1), train: make(chan struct{}, 1), vias: map[string]*viaRoad{}, fwdBuckets: map[string]*fwdBucket{}}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
@@ -814,7 +817,7 @@ func (n *Node) EventOn(peer string, stream uint64, tool, event int, args ...any)
 		if p := n.Trust.Get(peer); p != nil {
 			grants = p.Grants
 		}
-		if GrantLevel(grants, n.toolNameLocked(tool)) < LevelRead {
+		if n.grantLevelLocked(grants, n.toolNameLocked(tool)) < LevelRead {
 			return nil
 		}
 	}
@@ -863,6 +866,9 @@ func (n *Node) infoLocked(peer string) []any {
 	}
 	for k := range n.levelHandlers { // tools whose handlers check the caller's level are tools too
 		add(k[0])
+	}
+	for k := range n.toolHandlers { // a tool of the spec served by one handler (HandleToolAll)
+		add(k)
 	}
 	info := []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked()), n.Kind, n.namedLocked()}
 	if fw := n.forwardsWire(peer); len(fw) > 0 { // whom we forward to for it (spec §3)
@@ -1310,7 +1316,7 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			if p := n.Trust.Get(peer); p != nil {
 				grants = p.Grants
 			}
-			level = GrantLevel(grants, n.toolNameLocked(tool))
+			level = n.grantLevelLocked(grants, n.toolNameLocked(tool))
 			forbidden = level < n.requiredLevelLocked(tool, method)
 		}
 		if lh := n.levelHandlers[[2]int{tool, method}]; lh != nil && !forbidden {
@@ -1420,6 +1426,8 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 					n.Trust.SetKind(peer, kind)
 				}
 			}
+			ps.fixed = map[int]int{}
+			_ = cbor.Unmarshal(a[6], &ps.fixed)
 			ps.named = nil
 			if len(a) >= 11 {
 				var named map[string][]int

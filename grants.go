@@ -147,10 +147,10 @@ func (n *Node) GrantedBy(peer string) []Grant {
 	return nil
 }
 
-// Level is the level a device has on one of our tools, by name.
+// Level is the level a device has on one of our tools, by name (counting its aliases, [Node.AliasTool]).
 func (n *Node) Level(peer, tool string) int {
 	if p := n.Trust.Get(peer); p != nil {
-		return GrantLevel(p.Grants, tool)
+		return n.LevelIn(p.Grants, tool)
 	}
 	return 0
 }

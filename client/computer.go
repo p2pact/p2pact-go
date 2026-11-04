@@ -77,8 +77,8 @@ func (c *Computer) Grants() []p2pact.Grant {
 }
 
 // Level is the level we have on a tool of the computer: 0 none, 1 [p2pact.LevelRead], 2
-// [p2pact.LevelWrite].
-func (c *Computer) Level(tool string) int { return p2pact.GrantLevel(c.Grants(), tool) }
+// [p2pact.LevelWrite]. Grants on a former name of the tool count ([p2pact.Node.AliasTool]).
+func (c *Computer) Level(tool string) int { return c.owner.node.LevelIn(c.Grants(), tool) }
 
 func (c *Computer) CanRead(tool string) bool  { return c.Level(tool) >= p2pact.LevelRead }
 func (c *Computer) CanWrite(tool string) bool { return c.Level(tool) >= p2pact.LevelWrite }
@@ -146,10 +146,12 @@ func (c *Computer) notify(tool int, method string, params map[string]any, stream
 func (c *Computer) ToolNumber(name string) (int, bool) { return c.owner.node.ToolNumber(c.id, name) }
 
 // CallTool calls a method of a tool by name; the number is the computer's own (hosted tools,
-// core spec §8.2). It waits for the computer's hello if it has not come. The result elements
-// are CBOR as the tool sent them.
+// core spec §8.2). It waits for the computer's hello if it has not come. A tool of the spec the
+// computer does not announce goes by a former name of it the computer does announce
+// ([p2pact.Node.AliasTool]): "p2pact.term" reaches an older computer that named its terminal itself.
+// The result elements are CBOR as the tool sent them.
 func (c *Computer) CallTool(ctx context.Context, name string, method int, args ...any) ([]cbor.RawMessage, error) {
-	if _, ok := c.ToolNumber(name); !ok {
+	if !c.owner.node.PeerHasTool(c.id, name) {
 		c.mu.Lock()
 		hello := c.hello
 		c.mu.Unlock()

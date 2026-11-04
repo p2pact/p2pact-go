@@ -492,3 +492,42 @@ func TestToolEventsOfUntypedTools(t *testing.T) {
 		t.Fatalf("%+v", e)
 	}
 }
+
+// The terminal by its spec name: an older computer that serves it only under a former name is
+// called by that name once the alias is declared, and a grant on the former name counts; when the
+// computer serves p2pact.term too, the call goes to tool 5.
+func TestTermByAliasThenByNumber(t *testing.T) {
+	const former = "com.example.oldterm"
+	v := connect(t, []p2pact.Grant{{Tool: former, Level: p2pact.LevelWrite}}, nil)
+	if err := v.client.Node().AliasTool(former, ToolTerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.engine.node.AliasTool(former, ToolTerm); err != nil {
+		t.Fatal(err)
+	}
+	answer := func(who string) p2pact.ToolHandler {
+		return func(string, int, int, []cbor.RawMessage) ([]any, error) { return []any{who}, nil }
+	}
+	if err := v.engine.node.HandleToolAll(former, answer("former")); err != nil {
+		t.Fatal(err)
+	}
+	c := v.computer
+	if c.Level(ToolTerm) != p2pact.LevelWrite || !c.CanWrite(former) {
+		t.Fatalf("levels: %d %d", c.Level(ToolTerm), c.Level(former))
+	}
+	call := func(want string) {
+		t.Helper()
+		res, err := c.CallTool(ctx5(t), ToolTerm, 1)
+		var s string
+		if err != nil || len(res) != 1 || cbor.Unmarshal(res[0], &s) != nil || s != want {
+			t.Fatalf("%q %v, want %q", s, err, want)
+		}
+	}
+	eventually(t, "former name in the hello", func() bool { return v.client.Node().PeerHasTool(c.ID(), former) })
+	call("former")
+	if err := v.engine.node.HandleToolAll(ToolTerm, answer("term")); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "tool 5 in the hello", func() bool { return v.client.Node().PeerHasTool(c.ID(), ToolTerm) })
+	call("term")
+}

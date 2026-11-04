@@ -3,6 +3,7 @@ package p2pact
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"strings"
 
@@ -17,6 +18,14 @@ var fixedTools = map[string]int{
 	"p2pact.fleet":   2,
 	"p2pact.family":  3,
 	"p2pact.plugins": 4,
+	"p2pact.term":    5,
+}
+
+// FixedTool is the number the spec gives a tool name (§8): 0–63, the same on every device.
+// false — the name is not one of the spec's.
+func FixedTool(name string) (int, bool) {
+	num, ok := fixedTools[name]
+	return num, ok
 }
 
 // FirstNamedTool is the first number a device may choose for a named tool (spec §8).
@@ -167,11 +176,120 @@ func (n *Node) CallTool(ctx context.Context, peer, name string, method int, args
 
 // CallToolOn is [Node.CallOn] by tool name.
 func (n *Node) CallToolOn(ctx context.Context, peer string, stream uint64, name string, method int, args ...any) ([]cbor.RawMessage, error) {
-	num, ok := n.ToolNumber(peer, name)
+	num, _, ok := n.ResolveTool(peer, name)
 	if !ok {
 		return nil, &Error{Code: ErrNoMethod, Text: "the device has no tool " + name}
 	}
 	return n.CallOn(ctx, peer, stream, num, method, args...)
+}
+
+// AliasTool declares alias a former name of the tool canonical (spec §8.1): a device may serve
+// one tool under both names, the name of the spec (say "p2pact.term", tool 5) and the one it
+// had before (say "dev.nomadcode.term", a named tool from 64 up). Grants on either name count
+// for both: a call or an event of either gets the highest level granted on any of them
+// ([Node.LevelIn]). It is also what [Node.CallTool] by canonical falls back to on a device that
+// announces only the alias. The alias is served as any named tool: register its handlers
+// ([Node.HandleToolAll], [Node.HandleTool]) — the same as canonical's — and answer and send
+// events under the number it was called by.
+func (n *Node) AliasTool(alias, canonical string) error {
+	if !ValidToolName(alias) {
+		return errors.New("bad alias: " + alias)
+	}
+	if _, fixed := fixedTools[canonical]; !fixed && !ValidToolName(canonical) {
+		return errors.New("bad tool name: " + canonical)
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if c, ok := n.aliases[canonical]; ok {
+		canonical = c // an alias of an alias names the same tool
+	}
+	if alias == canonical {
+		return errors.New("a tool is not its own alias: " + alias)
+	}
+	n.aliases[alias] = canonical
+	return nil
+}
+
+// toolNamesLocked is a tool name with its aliases: the tool's name now first, then its former ones.
+func (n *Node) toolNamesLocked(name string) []string {
+	if c, ok := n.aliases[name]; ok {
+		name = c
+	}
+	out := []string{name}
+	for a, c := range n.aliases {
+		if c == name {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// grantLevelLocked is [GrantLevel] over a tool's names: the highest level grants give on any of them.
+func (n *Node) grantLevelLocked(grants []Grant, name string) int {
+	level := 0
+	for _, nm := range n.toolNamesLocked(name) {
+		level = max(level, GrantLevel(grants, nm))
+	}
+	return level
+}
+
+// LevelIn is the level a list of grants gives on a tool, counting its aliases ([Node.AliasTool]):
+// [GrantLevel] for a tool known by more than one name.
+func (n *Node) LevelIn(grants []Grant, tool string) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.grantLevelLocked(grants, tool)
+}
+
+// PeerHasTool reports whether a device announced the tool in its last hello: a tool of the spec
+// in its {tool: version}, a named one in its named map. false before its hello.
+func (n *Node) PeerHasTool(peer, name string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.peerHasToolLocked(peer, name)
+}
+
+func (n *Node) peerHasToolLocked(peer, name string) bool {
+	ps := n.peers[peer]
+	if ps == nil {
+		return false
+	}
+	if num, ok := fixedTools[name]; ok {
+		_, has := ps.fixed[num]
+		return has
+	}
+	_, has := ps.named[name]
+	return has
+}
+
+// ResolveTool is the number to call a tool on a device by, and the name it goes under there:
+// the name itself if the device announced it, else an alias of it ([Node.AliasTool]) the device
+// announced — a device that knows the tool only by its former name — else, for a tool of the
+// spec, its fixed number (the device's hello has not come, or it does not list the tool). false —
+// a named tool the device has not announced under any of its names.
+func (n *Node) ResolveTool(peer, name string) (num int, called string, ok bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	names := n.toolNamesLocked(name)
+	if names[0] != name { // asked by an alias: try it first, then the rest
+		names = append([]string{name}, slices.DeleteFunc(names, func(s string) bool { return s == name })...)
+	}
+	for _, nm := range names {
+		if n.peerHasToolLocked(peer, nm) {
+			return n.peerToolNumberLocked(peer, nm), nm, true
+		}
+	}
+	if num, ok := fixedTools[name]; ok {
+		return num, name, true
+	}
+	return 0, "", false
+}
+
+func (n *Node) peerToolNumberLocked(peer, name string) int {
+	if num, ok := fixedTools[name]; ok {
+		return num
+	}
+	return n.peers[peer].named[name].Number
 }
 
 // namedLocked is the hello's named map: {name: [tool, version]}.
@@ -190,24 +308,35 @@ type ToolHandler func(peer string, level, method int, args []cbor.RawMessage) ([
 // HandleToolAll serves every method of the named tool with h (the tool is registered at version
 // 1 if it is not yet). The node only requires read on the tool; what each method needs is for h
 // to check. Methods registered one by one with [Node.Handle] keep their own handlers. For a
-// device that hosts another program's tool (spec §8.2).
+// device that hosts another program's tool (spec §8.2), or one that serves a tool of the spec
+// (a name of [FixedTool], such as "p2pact.term") itself: it is announced under its fixed number.
 func (n *Node) HandleToolAll(name string, h ToolHandler) error {
-	num, err := n.RegisterTool(name, 1)
-	if err != nil {
-		return err
+	num, fixed := fixedTools[name]
+	if !fixed {
+		var err error
+		if num, err = n.RegisterTool(name, 1); err != nil {
+			return err
+		}
 	}
 	n.mu.Lock()
 	n.toolHandlers[num] = h
+	if fixed {
+		n.reannounceToolsLocked()
+	}
 	n.mu.Unlock()
 	return nil
 }
 
-// UnregisterTool takes a named tool back: it leaves the hello (sent again to the devices in
-// session) and its handlers are dropped. Registering the name again may give another number.
+// UnregisterTool takes a tool back: it leaves the hello (sent again to the devices in session)
+// and its handlers are dropped. Registering a name again may give another number. For a tool of
+// the spec, its handlers are dropped and it leaves the hello.
 func (n *Node) UnregisterTool(name string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	num, ok := n.names[name]
+	if fixed, isFixed := fixedTools[name]; isFixed && fixed != 0 {
+		num, ok = fixed, true
+	}
 	if !ok {
 		return
 	}
