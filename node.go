@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"log"
 	"os"
 	"runtime"
 	"sort"
@@ -228,6 +229,11 @@ type Node struct {
 	kick  chan struct{} // something was queued: send now, not on the next tick
 	train chan struct{} // one dictionary is trained at a time
 	wg    sync.WaitGroup
+	// inflight counts call and event handlers running (and work answered Later): Close waits
+	// for them, but no longer than closeWait. ctx ends when Close starts (Context).
+	inflight sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
 	// handshakes counts sessions set up (for tests: a network change needs no new one)
 	handshakes atomic.Int64
 }
@@ -243,6 +249,7 @@ func NewNode(dir, name string) (*Node, error) {
 		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, inviteGrants: map[string][]Grant{}, inviteAsk: map[string]bool{}, peers: map[string]*peerState{},
 		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, toolHandlers: map[int]ToolHandler{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
 		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
+	n.ctx, n.cancel = context.WithCancel(context.Background())
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
 	n.Handle(0, 2, func(peer string, _ []cbor.RawMessage) ([]any, error) { return n.info(peer), nil })
 	n.Handle(0, 5, n.dictHandler)
@@ -372,9 +379,17 @@ func (n *Node) Start() {
 	}()
 }
 
+// closeWait bounds how long Close waits for call and event handlers that ignore Context.
+var closeWait = 5 * time.Second
+
+// Close stops the node. A call or event handler running at that moment finishes its turn
+// (Context ends, so a handler that waits on something should stop); the calls and events
+// queued behind it do not run. Close waits for the handlers in flight, at most closeWait, and
+// for the node's own goroutines and callbacks (OnPaired, OnHello, OnGranted).
 func (n *Node) Close() {
 	n.mu.Lock() // under the lock: SetPaused sees either a running node or a closed one
 	close(n.stop)
+	n.cancel()
 	if n.udp != nil {
 		n.udp.close()
 	}
@@ -395,8 +410,19 @@ func (n *Node) Close() {
 	for _, a := range apps {
 		a.Detach()
 	}
+	done := make(chan struct{})
+	go func() { n.inflight.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(closeWait):
+		log.Printf("p2pact: Close: a call or event handler still runs after %v; not waiting for it", closeWait)
+	}
 	n.wg.Wait()
 }
+
+// Context ends when the node closes. A handler that waits (on a process, on another device)
+// selects on it, so that Close is not held up.
+func (n *Node) Context() context.Context { return n.ctx }
 
 // SetPaused pauses the node (on) or resumes it: for a computer going to sleep, so that nothing
 // the node does on the network wakes it. While paused the node sends nothing at all and takes
@@ -723,6 +749,8 @@ func (n *Node) CallOn(ctx context.Context, peer string, stream uint64, tool, met
 		return r.res, r.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-n.stop: // no answer can come: a handler calling another device does not hold up Close
+		return nil, errors.New("node closed")
 	}
 }
 
@@ -1275,13 +1303,17 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			res, err := h(peer, args)
 			var l *later
 			if errors.As(err, &l) { // the turn ends here; the reply goes when the work is done
-				go func() { reply(l.work()) }()
+				n.inflight.Add(1) // this handler is still counted: Close cannot be past its wait
+				go func() { defer n.inflight.Done(); reply(l.work()) }()
 				return
 			}
 			reply(res, err)
 		}
 		if tool == 0 { // service calls (a dictionary, a ping) never wait behind a slow handler
-			go run()
+			if !n.stoppedLocked() {
+				n.inflight.Add(1)
+				go func() { defer n.inflight.Done(); run() }()
+			}
 		} else {
 			n.inboxLocked(ps, stream, run)
 		}
@@ -1383,7 +1415,12 @@ type inbox struct {
 
 // inboxLocked queues f behind the stream's earlier calls and events. Each stream has its own
 // worker while it has work: a slow handler holds up its stream only, never the node's lock.
+// Once the node is closing nothing is queued, and a worker stops after the handler it runs:
+// what is still queued is dropped (Close waits for the handler, not for the queue).
 func (n *Node) inboxLocked(ps *peerState, stream uint64, f func()) {
+	if n.stoppedLocked() {
+		return
+	}
 	if ps.inbox == nil {
 		ps.inbox = map[uint64]*inbox{}
 	}
@@ -1397,10 +1434,12 @@ func (n *Node) inboxLocked(ps *peerState, stream uint64, f func()) {
 		return
 	}
 	ib.running = true
+	n.inflight.Add(1)
 	go func() {
+		defer n.inflight.Done()
 		for {
 			n.mu.Lock()
-			if len(ib.q) == 0 {
+			if len(ib.q) == 0 || n.stoppedLocked() {
 				delete(ps.inbox, stream)
 				n.mu.Unlock()
 				return
@@ -2040,6 +2079,16 @@ func (n *Node) fetchDictLocked(peer string, ps *peerState, id []byte) {
 		n.fetchNewLocked(peer, ps)
 	}) {
 		ps.fetching = false
+	}
+}
+
+// stoppedLocked tells whether Close has started.
+func (n *Node) stoppedLocked() bool {
+	select {
+	case <-n.stop:
+		return true
+	default:
+		return false
 	}
 }
 
