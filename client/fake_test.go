@@ -193,6 +193,13 @@ func (e *fakeEngine) last(tool int, method string) (seenCall, bool) {
 	return seenCall{}, false
 }
 
+// override sets an answer ("1:session/list") while the engine may be serving calls.
+func (e *fakeEngine) override(key string, f func(map[string]any) map[string]any) {
+	e.mu.Lock()
+	e.overrides[key] = f
+	e.mu.Unlock()
+}
+
 func (e *fakeEngine) rpc(tool, level int, args []cbor.RawMessage, reads map[string]bool) ([]any, error) {
 	var req struct {
 		Method string         `json:"method"`

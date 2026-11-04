@@ -102,7 +102,7 @@ func (c *ChatClient) initializeLocked(ctx context.Context) (*InitializeResult, e
 	params := map[string]any{
 		"protocolVersion":    1,
 		"clientCapabilities": map[string]any{},
-		"_meta":              map[string]any{"p2pact": map[string]any{"ext": 1}},
+		"_meta":              map[string]any{"p2pact": map[string]any{"ext": 1, "v": 2}},
 	}
 	r, err := c.computer.rpc(ctx, numChat, "initialize", params, 0, false)
 	if err != nil {
@@ -324,19 +324,90 @@ func (c *ChatClient) RequestOn(ctx context.Context, stream uint64, method string
 // that come later arrive in Reports. A failure the person should see is the line
 // `{"cmd":"alert"}`.
 func (c *ChatClient) Command(ctx context.Context, name string, params map[string]any) ([]json.RawMessage, error) {
+	_, lines, err := c.extension(ctx, name, params)
+	return lines, err
+}
+
+// extension calls `_p2pact/<name>` and gives the whole result (typed fields, §9.3) and its lines.
+func (c *ChatClient) extension(ctx context.Context, name string, params map[string]any) (json.RawMessage, []json.RawMessage, error) {
 	if params == nil {
 		params = map[string]any{}
 	}
 	sid, _ := params["sessionId"].(string)
 	r, err := c.callSettled(ctx, "_p2pact/"+name, wire(params).(map[string]any), StreamOf(sid))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var w struct {
 		Lines json.RawMessage `json:"lines"`
 	}
 	decode(r, &w)
-	return rawList(w.Lines), nil
+	return r, rawList(w.Lines), nil
+}
+
+// pickResult picks where a method's answer is read from: the result itself when it carries the typed
+// field `key` (engine speaking §9.3), else the line `cmd` of `lines` (an older engine). A late
+// line of an older engine (commands, agents, history without `v: 2`) is not waited for here: it
+// arrives in Reports, and the typed call gives what was ready.
+func pickResult(res json.RawMessage, lines []json.RawMessage, key, cmd string) json.RawMessage {
+	var m map[string]json.RawMessage
+	decode(res, &m)
+	if _, ok := m[key]; ok {
+		return res
+	}
+	return commandLine(lines, cmd)
+}
+
+// okResult reads `{"ok": ...}` of a write method; an older engine gave only lines, no `ok` then
+// means success unless an `alert` line says otherwise.
+func okResult(res json.RawMessage, lines []json.RawMessage) *OKResult {
+	var w struct {
+		OK    *bool  `json:"ok"`
+		Error string `json:"error"`
+	}
+	decode(res, &w)
+	r := &OKResult{Raw: clone(res)}
+	switch {
+	case w.OK != nil:
+		r.OK, r.Error = *w.OK, w.Error
+	default:
+		r.OK = true
+		var a struct{ Text string }
+		if l := commandLine(lines, "alert"); len(l) > 2 {
+			decode(l, &a)
+			r.OK, r.Error = false, a.Text
+		}
+	}
+	return r
+}
+
+// CloseChat is [ChatClient.Close] with the typed result `{ok, error}`.
+func (c *ChatClient) CloseChat(ctx context.Context, sessionID string) (*OKResult, error) {
+	return c.write(ctx, "close", map[string]any{"sessionId": sessionID})
+}
+
+// RestartChat is [ChatClient.Restart] with the typed result.
+func (c *ChatClient) RestartChat(ctx context.Context, sessionID string) (*OKResult, error) {
+	return c.write(ctx, "restart", map[string]any{"sessionId": sessionID})
+}
+
+// HideChat is [ChatClient.Hide] with the typed result.
+func (c *ChatClient) HideChat(ctx context.Context, sessionID string, on bool) (*OKResult, error) {
+	return c.write(ctx, "hide", map[string]any{"sessionId": sessionID, "on": on})
+}
+
+// HistoryOpen is `_p2pact/history_open`: bring a closed conversation (the id of a
+// [HistoryItem]) back into the list as closed, so it can be loaded and continued.
+func (c *ChatClient) HistoryOpen(ctx context.Context, historyID string) (*OKResult, error) {
+	return c.write(ctx, "history_open", map[string]any{"sessionId": historyID})
+}
+
+func (c *ChatClient) write(ctx context.Context, name string, params map[string]any) (*OKResult, error) {
+	res, lines, err := c.extension(ctx, name, params)
+	if err != nil {
+		return nil, err
+	}
+	return okResult(res, lines), nil
 }
 
 // Close closes the chat: it leaves the list.
@@ -366,70 +437,6 @@ func commandLine(lines []json.RawMessage, cmd string) json.RawMessage {
 		}
 	}
 	return json.RawMessage("{}")
-}
-
-// Older is `_p2pact/older`: the page of messages just before `before` (the `seq` of the oldest
-// you have).
-func (c *ChatClient) Older(ctx context.Context, sessionID string, before int64) (*OlderPage, error) {
-	lines, err := c.Command(ctx, "older", map[string]any{"sessionId": sessionID, "before": before})
-	if err != nil {
-		return nil, err
-	}
-	l := commandLine(lines, "older")
-	var w struct {
-		Messages json.RawMessage `json:"messages"`
-		More     bool            `json:"more"`
-	}
-	decode(l, &w)
-	msgs := parseAll(w.Messages, func(r json.RawMessage) ChatMessage {
-		var m struct {
-			Seq    int64
-			Role   string
-			Text   string
-			Time   string
-			Images []string
-		}
-		decode(r, &m)
-		return ChatMessage{m.Seq, m.Role, m.Text, m.Time, m.Images, clone(r)}
-	})
-	return &OlderPage{sessionID, msgs, w.More, clone(l)}, nil
-}
-
-// Diff is `_p2pact/diff`: the changes in the chat's folder (git).
-func (c *ChatClient) Diff(ctx context.Context, sessionID string) (*DiffResult, error) {
-	lines, err := c.Command(ctx, "diff", map[string]any{"sessionId": sessionID})
-	if err != nil {
-		return nil, err
-	}
-	l := commandLine(lines, "diff")
-	var w struct {
-		Files []struct {
-			Path           string
-			Added, Removed int
-			Status         string
-		}
-		Patch     string
-		Truncated bool
-		Error     string
-	}
-	decode(l, &w)
-	d := &DiffResult{Patch: w.Patch, Truncated: w.Truncated, Error: w.Error, Raw: clone(l)}
-	for _, f := range w.Files {
-		d.Files = append(d.Files, DiffFile{f.Path, f.Added, f.Removed, f.Status})
-	}
-	return d, nil
-}
-
-// Image is `_p2pact/image`: the bytes (base64) of an image a message points to.
-func (c *ChatClient) Image(ctx context.Context, sessionID, path string) (*ImageResult, error) {
-	lines, err := c.Command(ctx, "image", map[string]any{"sessionId": sessionID, "path": path})
-	if err != nil {
-		return nil, err
-	}
-	l := commandLine(lines, "image")
-	var w struct{ Data, Error string }
-	decode(l, &w)
-	return &ImageResult{w.Data, w.Error, clone(l)}, nil
 }
 
 // NewMID is a fresh message id for [ChatClient.PromptBlocks] and [ChatClient.NewSession].

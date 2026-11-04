@@ -39,7 +39,10 @@ type InitializeResult struct {
 	Agents []AgentInfo
 	// Extensions: the computer speaks the `_p2pact/<name>` extensions.
 	Extensions bool
-	Raw        json.RawMessage
+	// V is the level of complete extension results the computer speaks (`_meta.p2pact.v`); 0
+	// for an older one. This client asks for 2.
+	V   int
+	Raw json.RawMessage
 }
 
 func parseInitialize(raw json.RawMessage) *InitializeResult {
@@ -56,13 +59,14 @@ func parseInitialize(raw json.RawMessage) *InitializeResult {
 	var meta struct {
 		Agents json.RawMessage `json:"agents"`
 		Ext    int             `json:"ext"`
+		V      int             `json:"v"`
 	}
 	decode(metaOf(raw), &meta)
 	if w.ProtocolVersion == 0 {
 		w.ProtocolVersion = 1
 	}
 	return &InitializeResult{w.ProtocolVersion, w.AgentInfo.Name, w.AgentInfo.Title, w.AgentInfo.Version,
-		w.AgentCapabilities.LoadSession, parseAll(meta.Agents, parseAgent), meta.Ext >= 1, clone(raw)}
+		w.AgentCapabilities.LoadSession, parseAll(meta.Agents, parseAgent), meta.Ext >= 1, meta.V, clone(raw)}
 }
 
 // SessionState of a chat. Values the SDK does not know are kept as they came.
@@ -288,6 +292,82 @@ type OlderPage struct {
 	Messages  []ChatMessage
 	More      bool
 	Raw       json.RawMessage
+	// Run is the id of the engine's run of the command (`run`), "" when it did not say.
+	Run string
+}
+
+// SlashCommand is a slash command of the chat's agent (`_p2pact/commands`).
+type SlashCommand struct {
+	Name, Desc, Hint string
+	Args             []SlashArg
+	Raw              json.RawMessage
+}
+
+// SlashArg is a value the command's argument may take.
+type SlashArg struct{ Value, Desc string }
+
+// HistoryItem is a closed conversation of `_p2pact/history`.
+type HistoryItem struct {
+	ID, Agent, Dir string
+	Project        string
+	Title          string
+	// Updated is in milliseconds; Count (messages) is 0 while the engine does not know it.
+	Updated int64
+	Count   int
+	// Open: the conversation is in the session list now.
+	Open bool
+	Raw  json.RawMessage
+}
+
+// HistoryPage is `_p2pact/history`: a page of up to 60 items.
+type HistoryPage struct {
+	Items       []HistoryItem
+	Query       string
+	From, Total int
+	// Cursor is the offset of the next page; HasMore is false on the last page.
+	Cursor  int
+	HasMore bool
+	Partial bool
+	Raw     json.RawMessage
+}
+
+// Projects is `_p2pact/projects`: folders to start a chat in.
+type Projects struct {
+	Dirs        []string
+	ProjectDirs map[string][]string
+	// DirRepos: folder → git remote.
+	DirRepos map[string]string
+	Raw      json.RawMessage
+}
+
+// AgentModels is an agent of `_p2pact/agents` with the models it offers.
+type AgentModels struct {
+	ID, Name, Type string
+	Enabled        bool
+	Models         []string
+	// Default is the default model, "" when none.
+	Default string
+	Raw     json.RawMessage
+}
+
+// AgentPreset is a ready-made choice (agent + model) of `_p2pact/agents`.
+type AgentPreset struct {
+	ID, Name string
+	Raw      json.RawMessage
+}
+
+// AgentList is `_p2pact/agents`; the first preset is the main one.
+type AgentList struct {
+	Agents  []AgentModels
+	Presets []AgentPreset
+	Raw     json.RawMessage
+}
+
+// OKResult is the answer of a write method (`close`, `restart`, `hide`, `history_open`).
+type OKResult struct {
+	OK    bool
+	Error string
+	Raw   json.RawMessage
 }
 
 type DiffFile struct {
@@ -313,6 +393,8 @@ type ImageResult struct {
 	// Error is "not_found", "no_file", "too_big" or "bad_image".
 	Error string
 	Raw   json.RawMessage
+	// Path and Mime (of the bytes, which may be downscaled) come with an engine that speaks §9.3.
+	Path, Mime string
 }
 
 // RequestAnswered is `_p2pact/request_answered`: another client answered; stop showing the request.

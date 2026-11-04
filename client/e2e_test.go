@@ -37,7 +37,7 @@ func startEngine(t *testing.T, decide string) *e2eEngine {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.cmd = exec.Command("go", "test", "-count=1", "-v", "-run", "^TestAppE2E$", "./cmd/nomadcode")
+	e.cmd = exec.Command("go", "test", "-count=1", "-v", "-run", "^TestAppE2E$", "./engine")
 	e.cmd.Dir = agent
 	e.cmd.Stdout, e.cmd.Stderr = logf, logf
 	e.cmd.Env = append(os.Environ(), "NOMAD_APP_E2E="+e.dir, "NOMAD_APP_E2E_DECIDE="+decide)
@@ -132,6 +132,20 @@ func TestAppE2E(t *testing.T) {
 		list, err := chat.ListAllSessions(ctx, "")
 		if err != nil || len(list) != 1 || list[0].ID != "s1" {
 			t.Fatalf("%v %v", list, err)
+		}
+		if info.V < 2 {
+			t.Fatalf("the engine does not speak v 2: %d", info.V)
+		}
+
+		// typed extension results (chat spec §9.3)
+		if ag, err := chat.Agents(ctx); err != nil || ag == nil {
+			t.Fatalf("agents: %v", err)
+		}
+		if p, err := chat.Projects(ctx, ""); err != nil || p == nil {
+			t.Fatalf("projects: %v", err)
+		}
+		if h, err := chat.History(ctx, "", 0); err != nil || h == nil || h.Total < len(h.Items) {
+			t.Fatalf("history: %v %+v", err, h)
 		}
 
 		// history
