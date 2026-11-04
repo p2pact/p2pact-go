@@ -17,6 +17,9 @@
 //
 // A first line with "op" instead of "channel" is a code slot request (slots.go): one answer,
 // then the relay closes.
+//
+// On UDP, on the same port number, it answers observe requests (ServeUDP, observe.go): it
+// tells a device its address as seen from the internet, for the direct road across NAT.
 package relay
 
 import (

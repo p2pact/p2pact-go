@@ -89,14 +89,15 @@ applications that pair with a computer running a P2PACT engine; see
 
 - Pairing by invite (Noise XXpsk2), sessions with data in the first packet (Noise IK).
 - Roads: UDP, TCP, relay, and roads the app provides (datagram or stream: Bluetooth LE). A
-  session moves between roads without a new handshake.
+  session moves between roads without a new handshake. Devices behind NAT learn their public
+  address from the relay and punch through to UDP; the relay stays as a fallback.
 - Delivery: streams, ack ranges, congestion control (a window that grows while no queue
   builds, timers from the measured round trip, a delivery-rate limit), retransmission over
   the next live road, long messages in parts.
 - Compression: zstd with the common dictionary and dictionaries each device trains for each
   device it talks to (fastCover, as `zstd --train`, with the parameters picked on held-out
   messages).
-- Not yet: the family tool, NAT hole punching.
+- Not yet: the family tool.
 
 ## Relay
 
@@ -105,7 +106,8 @@ go run ./cmd/p2pact-relay -addr :8443 -data ./relay-data
 ```
 
 It prints its certificate fingerprint; give devices the address and the fingerprint. The relay
-forwards encrypted packets and cannot read them.
+forwards encrypted packets and cannot read them. Open the port for both TCP and UDP: on UDP
+it tells devices their public address, so they can reach each other directly.
 
 ## Tests
 

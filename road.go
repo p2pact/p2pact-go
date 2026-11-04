@@ -187,6 +187,7 @@ func (u *UDPRoad) close() { _ = u.conn.Close() }
 type RelayRoad struct {
 	hint RelayHint
 	recv func([]byte, Endpoint)
+	up   func(*RelayRoad) // a channel opened (the node asks the relay where it is seen from)
 	mu   sync.Mutex
 	ch   map[string]*relayChan
 }
@@ -311,6 +312,9 @@ func (r *RelayRoad) session(channel string, c *relayChan) error {
 	}
 	if !strings.Contains(line, `"ok":true`) {
 		return errors.New("relay refused: " + strings.TrimSpace(line))
+	}
+	if r.up != nil {
+		r.up(r)
 	}
 	done := make(chan struct{})
 	defer close(done)

@@ -9,6 +9,9 @@
 // The TLS certificate is self-signed and created on first run; its fingerprint is printed at
 // start. Give devices the address and the fingerprint (RelayHint).
 //
+// The same port number on UDP answers observe requests: devices behind NAT learn their public
+// address and reach each other directly. Open it in the firewall next to the TCP port.
+//
 // A WebSocket listener (-ws-addr, -ws-host) serves browsers, which cannot pin a certificate: it
 // needs one from a certificate authority — Let's Encrypt for -ws-host (kept in <data>/autocert,
 // port 443 must be reachable), or files (-ws-cert, -ws-key). It feeds the same channels as the
@@ -103,6 +106,13 @@ func main() {
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		fail(err)
+	}
+	// observe (spec §4.1) on UDP, same port: devices learn their public address and try the
+	// direct road. Without it the relay still relays.
+	if pc, err := net.ListenPacket("udp", ln.Addr().String()); err != nil {
+		slog.Warn("no UDP observe: devices behind NAT will not try the direct road", "err", err)
+	} else {
+		go func() { _ = srv.ServeUDP(pc) }()
 	}
 	slog.Info("relay started", "addr", ln.Addr().String(), "fingerprint", fp)
 	tl := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})

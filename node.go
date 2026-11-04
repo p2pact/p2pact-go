@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"log"
+	"net/netip"
 	"os"
 	"runtime"
 	"slices"
@@ -115,11 +116,13 @@ type peerState struct {
 	lastInit time.Time
 	// the direct roads were last tried while the session ran over a relay or an application road
 	lastProbe time.Time
-	calls     map[uint64]chan callResult
-	callID    uint64
-	dicts     [][]byte  // its dictionaries (ids), newest first — from its hello and 0.5
-	lacks     [][]byte  // it asked us for these, so it lacks them until it announces again
-	waiting   []inbound // waiting for a dictionary (spec §5): run in order once it arrives
+	// a punch burst (punch.go): runs until punchUntil; its last keepalives went at punchAt
+	punchUntil, punchAt time.Time
+	calls               map[uint64]chan callResult
+	callID              uint64
+	dicts               [][]byte  // its dictionaries (ids), newest first — from its hello and 0.5
+	lacks               [][]byte  // it asked us for these, so it lacks them until it announces again
+	waiting             []inbound // waiting for a dictionary (spec §5): run in order once it arrives
 	// waitSince: when the head of waiting started to wait (maintainLocked unblocks it)
 	waitSince time.Time
 	fetching  bool
@@ -212,6 +215,16 @@ type Node struct {
 	apps      map[*AttachedRoad]bool // roads the application provides (approad.go)
 	// paused: the device sleeps (SetPaused): nothing is sent, nothing is taken in
 	paused bool
+	// observe (punch.go): reflexive — our UDP address as our relay sees it, last heard at
+	// obsGot; obsTo — the relay's UDP address, resolved for obsFor; obsAt — the last request;
+	// obsSent — requests waiting for their answer, by nonce
+	reflexive    string
+	obsGot       time.Time
+	obsTo        netip.AddrPort
+	obsFor       string
+	obsResolving bool
+	obsAt        time.Time
+	obsSent      map[[16]byte]observeReq
 
 	sessions map[uint32]*session // by our index
 	current  map[string]*session // the best session with a device
@@ -298,6 +311,10 @@ func (n *Node) RebindUDP(addr string) error {
 	old := n.udp
 	n.udp = u
 	now := time.Now()
+	// the NAT mapping of the old socket is gone: forget it, ask the relay about the new one
+	n.setReflexiveLocked(now, "")
+	n.obsAt = time.Time{}
+	n.observeLocked(now, true)
 	for peer, ps := range n.peers {
 		for k, e := range ps.eps {
 			if old != nil && e.ep.Road == Road(old) {
@@ -342,6 +359,7 @@ func (n *Node) UDP() *UDPRoad { return n.udp }
 func (n *Node) SetRelay(h RelayHint) {
 	n.mu.Lock()
 	n.own = &h
+	n.observeLocked(time.Now(), true)
 	if !n.paused { // the invites that came back from the store (EnableInviteStore) wait here too
 		for id := range n.invites {
 			n.relayLocked(h).join(id, "a")
@@ -472,6 +490,7 @@ func (n *Node) SetPaused(on bool) {
 		return
 	}
 	now := time.Now()
+	n.observeLocked(now, true)
 	if n.own != nil {
 		for id := range n.invites {
 			n.relayLocked(*n.own).join(id, "a")
@@ -886,11 +905,12 @@ func (n *Node) hintsLocked() Hints {
 		if len(h.WS) == 0 {
 			h.WS = n.ownWS
 		}
+		h.UDP = n.withReflexive(h.UDP)
 		return h
 	}
 	var h Hints
 	if n.udp != nil {
-		h.UDP = n.udp.localAddrs()
+		h.UDP = n.withReflexive(n.udp.localAddrs())
 	}
 	if n.tcp != nil {
 		h.TCP = n.tcp.localAddrs()
@@ -932,6 +952,8 @@ func (n *Node) receiveLocked(pkt []byte, from Endpoint) {
 		n.onPair2Locked(now, pkt, from)
 	case pPair3:
 		n.onPair3Locked(now, pkt, from)
+	case pObserve:
+		n.onObserveLocked(now, pkt, from)
 	case pReset:
 		idx := u32(pkt[1:5])
 		for _, s := range n.sessions {
@@ -1027,6 +1049,7 @@ func (n *Node) onInitLocked(now time.Time, pkt []byte, from Endpoint) {
 	n.current[peer] = s
 	n.handshakes.Add(1)
 	n.seenLocked(ps, from, now, s.local)
+	n.punchIfRelayedLocked(now, peer, ps, from)
 	n.bootLocked(ps, binary.BigEndian.Uint32(payload[8:12]))
 	out := put32(put32([]byte{pResp}, s.remote), local)
 	_ = from.Road.Send(from.Addr, append(out, resp...))
@@ -1060,6 +1083,7 @@ func (n *Node) onRespLocked(now time.Time, pkt []byte, from Endpoint) {
 	ps := n.peerLocked(h.peer)
 	ps.heard = true
 	n.seenLocked(ps, from, now, s.local)
+	n.punchIfRelayedLocked(now, h.peer, ps, from)
 	n.bootLocked(ps, binary.BigEndian.Uint32(payload[:4]))
 	n.sendInfoLocked(h.peer)
 	for _, e := range h.early {
@@ -1144,6 +1168,7 @@ func (n *Node) onPair2Locked(now time.Time, pkt []byte, from Endpoint) {
 	ps := n.peerLocked(peer)
 	n.seenLocked(ps, from, now, s.local)
 	n.bootLocked(ps, pp.Boot)
+	n.punchIfRelayedLocked(now, peer, ps, from)
 	_ = from.Road.Send(from.Addr, append(put32([]byte{pPair3}, s.remote), msg3...))
 	n.pairedLocked(p)
 	h.done <- nil
@@ -1206,6 +1231,7 @@ func (n *Node) onPair3Locked(now time.Time, pkt []byte, from Endpoint) {
 	ps := n.peerLocked(peer)
 	n.seenLocked(ps, from, now, s.local)
 	n.bootLocked(ps, pp.Boot)
+	n.punchIfRelayedLocked(now, peer, ps, from)
 	if ask {
 		wants := pp.Wants
 		if !pp.HasWants {
@@ -1379,7 +1405,14 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 			_ = cbor.Unmarshal(a[3], &name)
 			_ = cbor.Unmarshal(a[4], &goos)
 			_ = cbor.Unmarshal(a[8], &hw)
+			var oldUDP []string
+			if p := n.Trust.Get(peer); p != nil {
+				oldUDP = p.Hints.UDP
+			}
 			n.Trust.SetHints(peer, name, goos, fromWire(hw))
+			if p := n.Trust.Get(peer); p != nil && !slices.Equal(oldUDP, p.Hints.UDP) {
+				n.punchLocked(time.Now(), peer, ps) // its addresses changed: try them (spec §7)
+			}
 			if len(a) >= 10 {
 				var kind int
 				if cbor.Unmarshal(a[9], &kind) == nil {
@@ -1658,6 +1691,7 @@ func (n *Node) relayLocked(h RelayHint) *RelayRoad {
 	r := n.rel[h.Addr]
 	if r == nil {
 		r = newRelayRoad(h, n.receive)
+		r.up = n.relayUp
 		n.rel[h.Addr] = r
 	}
 	return r
@@ -1770,6 +1804,7 @@ func (n *Node) pumpLocked(now time.Time) {
 				}
 			}
 		}
+		n.punchStepLocked(now, peer, ps, s)
 	}
 }
 
@@ -1830,6 +1865,7 @@ func (n *Node) maintainLocked(now time.Time) {
 		}
 	}
 	n.unholdLocked(now)
+	n.observeLocked(now, false)
 	n.reannounceLocked(now)
 	for idx, s := range n.sessions {
 		if n.current[s.peer] != s && now.Sub(s.lastRecv) > sessionIdle {

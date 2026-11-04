@@ -14,6 +14,9 @@ const (
 	pPair3 = 5 // [5][receiver index 4][Noise]
 	pData  = 6 // [6][receiver index 4][packet number 4][ciphertext + tag 16]
 	pReset = 7 // [7][index we do not know 4]
+	// observe, UDP between a device and its relay only (punch.go): [8][nonce 16][zero 19] →
+	// [8][nonce 16][ip 16][port 2]
+	pObserve = 8
 )
 
 // dataHeader is the cleartext part of a data packet before the ciphertext; it is also the
