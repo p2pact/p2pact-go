@@ -207,3 +207,55 @@ func TestPluginEnvNeedsSocket(t *testing.T) {
 		t.Fatal("a plugin started by nobody")
 	}
 }
+
+// A LocalOnly device is reached over the local socket only. While the program is away the node
+// does not call it through its relay (which would hold those session starts), and the program,
+// coming back with the same keys, does not join the pair's relay channel or take a start that
+// came over it: its one live road stays the socket on both sides.
+func TestLocalOnlyNoRelay(t *testing.T) {
+	rh := relayServer(t)
+	sock := filepath.Join(shortDir(t), "host.sock")
+	host := node(t, "Mac", false, &rh)
+	defer host.Close()
+	if err := host.ListenLocal(sock); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	prog, err := NewNode(dir, "cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog.Close() // only its keys: the program is not running
+	secret := make([]byte, 32)
+	host.Trust.Put(Peer{Addr: prog.ID.Addr(), Key: prog.ID.Key.Public, PairSecret: secret, Kind: KindClient, LocalOnly: true})
+	// what the program heard of the host before: its relay as well
+	LoadTrust(dir).Put(Peer{Addr: host.ID.Addr(), Key: host.ID.Key.Public, PairSecret: secret, Kind: KindComputer,
+		Local: true, LocalOnly: true, Hints: Hints{Relay: &rh}})
+	if err := host.Event(prog.ID.Addr(), 64, 1, []byte("for the program that left")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second) // without LocalOnly the host's starts would wait on the relay by now
+	if k := relayChannels(host); k != 0 {
+		t.Fatalf("the host joined %d relay channels for a local-only device", k)
+	}
+	prog, err = NewNode(dir, "cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prog.Close()
+	if err := prog.UseLocal(sock); err != nil {
+		t.Fatal(err)
+	}
+	prog.Start()
+	echo(t, prog, host, []byte("back"), 5*time.Second)
+	time.Sleep(2 * time.Second) // the program's upkeep would have joined the relay channel by now
+	if k := relayChannels(prog); k != 0 {
+		t.Fatalf("the program joined %d relay channels", k)
+	}
+	if p := host.Paths(prog.ID.Addr()); len(p) != 1 || p[0] != "local" {
+		t.Fatalf("host's roads to the program: %v", p)
+	}
+	if p := prog.Paths(host.ID.Addr()); len(p) != 1 || p[0] != "local" {
+		t.Fatalf("program's roads to the host: %v", p)
+	}
+}

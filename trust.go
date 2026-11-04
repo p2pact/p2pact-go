@@ -44,6 +44,12 @@ type Peer struct {
 	Granted []Grant `json:"granted,omitzero"`
 	// Local: we reach the device over our local socket (a plugin's host, spec §3).
 	Local bool `json:"local,omitempty"`
+	// LocalOnly: the device is on this computer and is reached over the local socket only, as a
+	// plugin is (a local CLI's identity and the node it talks to): no other road is tried, its
+	// relay channel is not joined, and a session it starts on another road is refused. Without
+	// it a relay holds the starts one side sent while the other was away, and the next process
+	// with the same keys takes them and opens a session over the relay.
+	LocalOnly bool `json:"local_only,omitempty"`
 	// Forward: the devices we forward to for this one (spec §3, Node.AllowForward); the consent
 	// is for the pair, so each of the two lists the other.
 	Forward []string `json:"forward,omitempty"`
@@ -51,6 +57,9 @@ type Peer struct {
 
 // Phone reports a phone OS: a phone is never the family parent (spec/family.md §1).
 func Phone(os string) bool { return os == "android" || os == "ios" }
+
+// localOnly reports a device reached over the local socket only: a plugin, or one marked LocalOnly.
+func (p *Peer) localOnly() bool { return p.Kind == KindPlugin || p.LocalOnly }
 
 // relayChannel is the pair's relay channel: only these two devices know it.
 func (p *Peer) relayChannel() string { return hexs(mac(p.PairSecret, "relay")[:16]) }

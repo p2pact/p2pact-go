@@ -1030,8 +1030,8 @@ func (n *Node) onInitLocked(now time.Time, pkt []byte, from Endpoint) {
 	if known == nil {
 		return // silence to strangers (spec §4.2)
 	}
-	if known.Kind == KindPlugin && !n.isLocalLocked(from) {
-		return // a plugin is reachable over the local socket only (spec §2)
+	if known.localOnly() && !n.isLocalLocked(from) {
+		return // a plugin (or a LocalOnly device) is reachable over the local socket only (spec §2)
 	}
 	ps := n.peerLocked(peer)
 	ts := binary.BigEndian.Uint64(payload[:8])
@@ -1610,7 +1610,7 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 	if p.Local && n.loc != nil && n.localPath != "" { // the device we dial on this computer
 		add(Endpoint{Road: n.loc, Addr: n.localPath})
 	}
-	if p.Kind == KindPlugin { // reachable over the local socket only, on the connection it opened
+	if p.localOnly() { // reachable over the local socket only, on the connection it opened
 		return out
 	}
 	if n.udp != nil {
@@ -1928,8 +1928,11 @@ func (n *Node) unholdLocked(now time.Time) {
 	}
 }
 
-// joinPairLocked keeps the pair's relay channel open.
+// joinPairLocked keeps the pair's relay channel open; a device on the local socket only has none.
 func (n *Node) joinPairLocked(p *Peer) {
+	if p.localOnly() {
+		return
+	}
 	if r := n.pairRelayLocked(p); r != nil {
 		role := "a"
 		if p.Addr < n.ID.Addr() {
