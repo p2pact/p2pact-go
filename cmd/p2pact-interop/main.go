@@ -52,6 +52,16 @@
 //	  hosts the named tool for a program paired as a plugin: one handler for all its methods
 //	  (method 2 needs write), every call is forwarded to the program's tool of that name
 //
+// Via a third device (spec §3):
+//
+//	{"cmd":"hide"}                                            → {"ok":true}
+//	  announces no addresses from now on (in invites and hellos): known devices reach us only
+//	  over roads they already have, or through a forwarder
+//	{"cmd":"forward","a":"…","b":"…","on":true|false}         → {"ok":true}
+//	  opts in (or out) as a forwarder between two devices we trust
+//	{"cmd":"paths","peer":"…"}                                → {"paths":["udp","via:<forwarder>",…]}
+//	{"cmd":"forward-stats"}                                   → {"forwarded":N,"dropped":N}
+//
 // Errors: {"error":"…"}. Usage: p2pact-interop [data dir] [name]
 package main
 
@@ -184,6 +194,8 @@ func main() {
 			Addr, FP                string
 			WS                      []string
 			Wants, Grants           [][]any
+			A, B                    string
+			On                      bool
 		}
 		if json.Unmarshal(in.Bytes(), &req) != nil {
 			say(map[string]string{"error": "bad json"})
@@ -445,6 +457,24 @@ func main() {
 				continue
 			}
 			say(map[string]bool{"ok": true})
+		case "hide":
+			n.SetAdvertise(&p2pact.Hints{})
+			say(map[string]bool{"ok": true})
+		case "forward":
+			if err := n.AllowForward(req.A, req.B, req.On); err != nil {
+				fail(err)
+				continue
+			}
+			say(map[string]bool{"ok": true})
+		case "paths":
+			p := n.Paths(req.Peer)
+			if p == nil {
+				p = []string{}
+			}
+			say(map[string][]string{"paths": p})
+		case "forward-stats":
+			fw, dr := n.ForwardStats()
+			say(map[string]int64{"forwarded": fw, "dropped": dr})
 		case "close":
 			n.Close()
 			return

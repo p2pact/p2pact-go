@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -133,6 +134,7 @@ type peerState struct {
 	queued     int
 	lastTalk   time.Time
 	inbox      map[uint64]*inbox // calls and events waiting for their turn, per stream
+	forwards   []string          // the devices it forwards to for us, from its hello (forward.go)
 }
 
 type inbound struct {
@@ -180,6 +182,15 @@ type Node struct {
 	NoLearning bool
 	// Kind is what this device is for (KindComputer…), told in pairing and the hello (spec §1).
 	Kind int
+	// ForwardRate is how many bytes a second we forward in one direction of a pair we forward
+	// for (AllowForward); 0 — DefaultForwardRate.
+	ForwardRate int
+
+	vias       map[string]*viaRoad               // roads through forwarders, by forwarder (forward.go)
+	fwdBuckets map[string]*fwdBucket             // rate limit per forwarded direction ("from>to")
+	forwardTap func(from, to string, pkt []byte) // tests: what we forward
+	fwdCount   atomic.Int64
+	fwdDropped atomic.Int64
 
 	advertise *Hints
 	// hintsSent: our addresses as last announced; hintsAt: when last checked (reannounceLocked)
@@ -248,7 +259,7 @@ func NewNode(dir, name string) (*Node, error) {
 		rel: map[string]*RelayRoad{}, apps: map[*AttachedRoad]bool{}, sessions: map[uint32]*session{}, current: map[string]*session{},
 		hs: map[uint32]*handshake{}, invites: map[string]*Invite{}, inviteGrants: map[string][]Grant{}, inviteAsk: map[string]bool{}, peers: map[string]*peerState{},
 		handlers: map[[2]int]Handler{}, levelHandlers: map[[2]int]LevelHandler{}, readMethods: map[[2]int]bool{}, toolHandlers: map[int]ToolHandler{}, names: map[string]int{}, numbers: map[int]string{}, versions: map[int]int{}, resetAt: map[string]time.Time{}, dicts: loadDicts(dir), stop: make(chan struct{}),
-		kick: make(chan struct{}, 1), train: make(chan struct{}, 1)}
+		kick: make(chan struct{}, 1), train: make(chan struct{}, 1), vias: map[string]*viaRoad{}, fwdBuckets: map[string]*fwdBucket{}}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
 	n.Handle(0, 1, func(string, []cbor.RawMessage) ([]any, error) { return []any{}, nil }) // ping
 	n.Handle(0, 2, func(peer string, _ []cbor.RawMessage) ([]any, error) { return n.info(peer), nil })
@@ -701,8 +712,15 @@ func (n *Node) Forget(addr string) {
 		delete(n.current, addr)
 		delete(n.sessions, s.local)
 	}
-	n.mu.Unlock()
+	var fw []string // the devices we forwarded to it for: they learn it is withdrawn
+	if p := n.Trust.Get(addr); p != nil {
+		fw = p.Forward
+	}
 	n.Trust.Remove(addr)
+	for _, a := range fw {
+		n.helloLocked(a)
+	}
+	n.mu.Unlock()
 }
 
 // --- calls and events ---
@@ -826,7 +844,11 @@ func (n *Node) infoLocked(peer string) []any {
 	for k := range n.levelHandlers { // tools whose handlers check the caller's level are tools too
 		add(k[0])
 	}
-	return []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked()), n.Kind, n.namedLocked()}
+	info := []any{n.Name, runtime.GOOS, "p2pact-go", tools, n.dicts.ids(peer), toWire(n.hintsLocked()), n.Kind, n.namedLocked()}
+	if fw := n.forwardsWire(peer); len(fw) > 0 { // whom we forward to for it (spec §3)
+		info = append(info, fw)
+	}
+	return info
 }
 
 // SetAdvertise announces these addresses instead of our own in invites and hellos: behind
@@ -889,6 +911,10 @@ func (n *Node) receive(pkt []byte, from Endpoint) {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.receiveLocked(pkt, from)
+}
+
+func (n *Node) receiveLocked(pkt []byte, from Endpoint) {
 	if n.paused { // what came is dropped unanswered: its sender sends it again after we resume
 		return
 	}
@@ -1372,6 +1398,11 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 					}
 				}
 			}
+			var fw *cbor.RawMessage
+			if len(a) >= 12 {
+				fw = &a[11]
+			}
+			n.heardForwardsLocked(peer, ps, fw)
 			if on := n.OnHello; on != nil {
 				n.goLocked(func() { on(peer) })
 			}
@@ -1388,6 +1419,14 @@ func (n *Node) messageLocked(peer string, msg []byte, stream uint64) {
 					n.goLocked(func() { on(peer, g) })
 				}
 			}
+			return
+		}
+		if tool == 0 && ev == evForward { // carry a packet to another device (spec §3)
+			n.forwardLocked(peer, a[3:])
+			return
+		}
+		if tool == 0 && ev == evForwarded { // a packet another device sent us through this one
+			n.forwardedLocked(peer, a[3:])
 			return
 		}
 		if tool == 0 && ev == 5 && len(a) >= 4 { // the dictionary list changed
@@ -1558,6 +1597,22 @@ func (n *Node) candidatesLocked(peer string, ps *peerState, now time.Time, all b
 			add(Endpoint{Road: a, Addr: a.id})
 		}
 	}
+	for x, xs := range n.peers { // devices that forward to it for us (spec §3)
+		if x != peer && n.current[x] != nil && slices.Contains(xs.forwards, peer) {
+			add(Endpoint{Road: n.viaLocked(x), Addr: peer})
+		}
+	}
+	// a road via a third device takes retransmissions only while no other road is live:
+	// every packet on it costs the forwarder (spec §7)
+	other := false
+	for _, e := range alive {
+		if !isVia(e.ep.Road) {
+			other = true
+		}
+	}
+	if other {
+		out = slices.DeleteFunc(out, func(e *epState) bool { return isVia(e.ep.Road) })
+	}
 	return out
 }
 
@@ -1569,6 +1624,9 @@ func roadRank(r Road) int {
 			return 1 // a direct link (a WebRTC data channel) ranks with TCP, above a relay
 		}
 		return 3
+	}
+	if isVia(r) {
+		return 3 // with an application road: it carries the session while nothing better is up
 	}
 	switch r.Name() {
 	case "udp":
@@ -1667,6 +1725,7 @@ func (n *Node) pumpLocked(now time.Time) {
 	if n.paused { // nothing goes, and no timer counts a try: delivery resumes where it stopped
 		return
 	}
+	n.fwdReleaseLocked(now)
 	for peer, ps := range n.peers {
 		s := n.current[peer]
 		if s == nil {
@@ -1684,7 +1743,8 @@ func (n *Node) pumpLocked(now time.Time) {
 			continue
 		}
 		if c := n.candidatesLocked(peer, ps, now, false); len(c) == 1 {
-			ps.st.reliable, ps.st.link = c[0].ep.Road.Name() != "udp", 0
+			// a road via a third device may drop (the forwarder's limits): a window applies, as on UDP
+			ps.st.reliable, ps.st.link = c[0].ep.Road.Name() != "udp" && !isVia(c[0].ep.Road), 0
 			if a, ok := c[0].ep.Road.(*AttachedRoad); ok {
 				ps.st.reliable, ps.st.link = a.cfg.Stream, a.rate()
 			}
@@ -2027,7 +2087,8 @@ func outOfOrder(msg []byte) bool {
 	if len(msg) < 2 {
 		return false
 	}
-	return msg[1] == 1 || msg[1] == 2 || (len(msg) > 3 && msg[1] == 3 && msg[2] == 0 && (msg[3] == 2 || msg[3] == 5))
+	return msg[1] == 1 || msg[1] == 2 || (len(msg) > 3 && msg[1] == 3 && msg[2] == 0 && (msg[3] == 2 || msg[3] == 5)) ||
+		forwardMsg(msg)
 }
 
 // fetchNewLocked asks the device for the newest dictionary in its list that we lack: so it

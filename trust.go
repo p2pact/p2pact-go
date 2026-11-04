@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -43,6 +44,9 @@ type Peer struct {
 	Granted []Grant `json:"granted,omitzero"`
 	// Local: we reach the device over our local socket (a plugin's host, spec §3).
 	Local bool `json:"local,omitempty"`
+	// Forward: the devices we forward to for this one (spec §3, Node.AllowForward); the consent
+	// is for the pair, so each of the two lists the other.
+	Forward []string `json:"forward,omitempty"`
 }
 
 // Phone reports a phone OS: a phone is never the family parent (spec/family.md §1).
@@ -172,8 +176,21 @@ func (t *Trust) Remove(addr string) bool {
 		return false
 	}
 	delete(t.peers, addr)
+	for _, p := range t.peers { // forgetting a device withdraws forwarding to it
+		p.Forward = slices.DeleteFunc(p.Forward, func(s string) bool { return s == addr })
+	}
 	t.saveLocked()
 	return true
+}
+
+// SetForward stores the devices we forward to for a known device.
+func (t *Trust) SetForward(addr string, list []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if p := t.peers[addr]; p != nil {
+		p.Forward = slices.Clone(list)
+		t.saveLocked()
+	}
 }
 
 func (t *Trust) saveLocked() {

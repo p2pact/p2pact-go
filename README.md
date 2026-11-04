@@ -71,6 +71,12 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
   — learnt from the first handshake on it, and offered to `Join` for pairing. The road is used
   while nothing better is up; the session moves to UDP, TCP or a relay as soon as one answers
   and comes back when they fall silent.
+- `AllowForward(a, b, on)` — opt this device in as a forwarder between two devices it trusts
+  (spec §3, via a third device): they reach each other through it when nothing else works, end
+  to end encrypted. Kept with the trusted list; `ForwardRate` limits each direction (256 KB/s by
+  default). The two devices need nothing: they learn it from the hello and use the road
+  `via:<forwarder>` (`Paths`) with the same rank as an application road. `Forwards`,
+  `Forwarders` and `ForwardStats` tell who forwards for whom and how much.
 
 ## Client for apps
 
