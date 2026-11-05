@@ -266,6 +266,7 @@ func TestObserveForcedOncePerSecond(t *testing.T) {
 	}()
 	h := RelayHint{Addr: fake.LocalAddr().String()}
 	a := node(t, "Mac", true, nil)
+	defer a.Close()
 	a.SetRelay(h)
 	within(t, 3*time.Second, "no observe request", func() bool { return got.Load() > 0 })
 	for range 5 { // the relay again, at once: too soon
