@@ -23,6 +23,9 @@ type TCPRoad struct {
 	// paused: no connections (the node pauses); the listener stays and refuses them
 	paused atomic.Bool
 	seq    atomic.Uint64
+	// closed is told that the connection with addr ended (EOF, an error, the read deadline, a
+	// failed dial) — not when the road closes or pauses. Set under mu; the local socket sets it.
+	closed func(addr string)
 
 	// Delay and Rate are for tests, as on UDPRoad.
 	Delay time.Duration
@@ -194,10 +197,15 @@ func (t *TCPRoad) serve(c net.Conn, addr string, tc *tcpConn) {
 func (t *TCPRoad) drop(addr string, tc *tcpConn) {
 	tc.close()
 	t.mu.Lock()
-	if t.conns[addr] == tc {
+	cur := t.conns[addr] == tc
+	if cur {
 		delete(t.conns, addr)
 	}
+	closed := t.closed
 	t.mu.Unlock()
+	if cur && closed != nil {
+		closed(addr)
+	}
 }
 
 // localAddrs lists our TCP addresses for hints.

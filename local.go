@@ -43,6 +43,9 @@ func (n *Node) ListenLocal(path string) error {
 		l.close()
 		return err
 	}
+	l.mu.Lock()
+	l.closed = n.localClosed
+	l.mu.Unlock()
 	n.mu.Lock()
 	n.loc, n.localPath = l, path
 	n.mu.Unlock()
@@ -56,6 +59,7 @@ func (n *Node) UseLocal(path string) error {
 		return errors.New("no socket path")
 	}
 	l, _ := listenStream("unix", "local", "", n.receive)
+	l.closed = n.localClosed // nothing runs on l yet
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.loc != nil {
@@ -70,6 +74,33 @@ func (n *Node) LocalPath() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.localPath
+}
+
+// localClosed: a connection of the local socket ended (the program closed it or exited, the
+// read deadline passed, a write stalled, the dial failed). The road it was is forgotten; a device
+// heard on it with no other live road left is gone (OnGone). A program that dials again comes
+// on a new connection, and its session goes on there.
+func (n *Node) localClosed(addr string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.loc == nil {
+		return
+	}
+	k := Endpoint{Road: n.loc, Addr: addr}.key()
+	now := time.Now()
+	for peer, ps := range n.peers {
+		e := ps.eps[k]
+		if e == nil {
+			continue
+		}
+		delete(ps.eps, k)
+		if e.lastRecv.IsZero() { // never heard on it (a dial that failed): it was not reached
+			continue
+		}
+		if !n.reachableLocked(ps, now) {
+			n.goneLocked(peer)
+		}
+	}
 }
 
 // isLocalLocked reports a packet that came over our local socket.

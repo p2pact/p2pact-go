@@ -180,6 +180,14 @@ type Node struct {
 	// OnHeld is called when messages from a device waited too long for a dictionary or its list,
 	// or were compressed with a dictionary the sender has dropped since, and were dropped (held — how many): the application can tell the user or resend.
 	OnHeld func(peer string, held int)
+	// OnGone is called, on a goroutine of its own, when a device we had a session with went out
+	// of reach: the connection of the local socket it was heard on ended (the program closed
+	// it, exited, a write to it stalled for 10 s, or nothing came on it for 3 minutes) and no
+	// other road to it is alive; or the session looked dead — data unacknowledged after four
+	// tries and nothing from the device for 10 s. A loss may be told by both. What the
+	// application sends the device meanwhile is still queued, as always, and goes if it comes
+	// back; OnGone is the sign to stop counting on that.
+	OnGone func(peer string)
 	// NoCompression turns compression off for what we send (benchmarks, debugging).
 	NoCompression bool
 	// NoLearning: do not train our own dictionaries on what we send (spec §5).
@@ -1783,6 +1791,7 @@ func (n *Node) pumpLocked(now time.Time) {
 		// nothing for 10 s while retransmitting: the session looks dead, start a new one
 		if !ps.st.idle() && now.Sub(s.lastRecv) > 10*time.Second && n.stuckLocked(ps) {
 			delete(n.current, peer)
+			n.goneLocked(peer)
 			continue
 		}
 		if c := n.candidatesLocked(peer, ps, now, false); len(c) == 1 {
@@ -1843,6 +1852,23 @@ func (ps *peerState) initGap() time.Duration {
 		return initEvery
 	}
 	return min(max(3*ps.st.srtt, 250*time.Millisecond), 2*time.Second)
+}
+
+// reachableLocked tells whether some road to the device is alive.
+func (n *Node) reachableLocked(ps *peerState, now time.Time) bool {
+	for _, e := range ps.eps {
+		if now.Sub(e.lastRecv) <= aliveFor {
+			return true
+		}
+	}
+	return false
+}
+
+// goneLocked tells the application that the device went out of reach (OnGone).
+func (n *Node) goneLocked(peer string) {
+	if on := n.OnGone; on != nil {
+		n.goLocked(func() { on(peer) })
+	}
 }
 
 func (n *Node) stuckLocked(ps *peerState) bool {
