@@ -40,11 +40,15 @@ const (
 	rtoMin    = 50 * time.Millisecond
 	rtoMax    = 4 * time.Second
 	ackDelay  = 40 * time.Millisecond
-	cwndStart = 32       // parts in flight at first
-	cwndMin   = 32       // never below (the old fixed window)
-	cwndMax   = 4096     // ~4.5 MB in flight
-	gotMax    = 8192     // parts held above the first gap
-	msgMax    = 16 << 20 // longer messages abort reassembly
+	cwndStart = 32   // parts in flight at first
+	cwndMin   = 32   // never below (the old fixed window)
+	cwndMax   = 4096 // ~4.5 MB in flight
+	// gotMax is how far past the first gap a part may be: the receiver drops parts at
+	// recvAck+gotMax and beyond, the sender keeps new parts below its lowest unacked+gotMax.
+	// (A bound on the number of parts held would drop the very part the gap waits for once
+	// that many arrived above it, and delivery would stop for good.)
+	gotMax = 8192
+	msgMax = 16 << 20 // longer messages abort reassembly
 	// linkQueue is how much of an application road's rate may be in flight: the first window
 	// on a slow link (Bluetooth), and a bound on the queue in it that the timers wait behind
 	linkQueue = time.Second
@@ -332,7 +336,7 @@ func (s *stream) nextPacket(now time.Time, forceAck bool) (plain []byte, retry b
 		retry = true
 		p.timer = !p.sent.IsZero() // not taken as lost by an ack: the timer ran out
 		s.lost(now)
-	} else if len(s.queue) > 0 && s.canSend() {
+	} else if len(s.queue) > 0 && s.canSend() && (lowest == 0 || s.queue[0].seq-lowest < gotMax) {
 		p = s.queue[0]
 		s.queue = s.queue[1:]
 		s.inflight[p.seq] = p
@@ -560,7 +564,7 @@ func (s *stream) receive(now time.Time, b []byte, deliver func(msg []byte, zip b
 	if s.unacked++; s.unacked >= 2 || seq != s.recvAck {
 		s.ackDue = now
 	}
-	if seq < s.recvAck || s.got[seq] != nil || len(s.got) >= gotMax {
+	if seq < s.recvAck || s.got[seq] != nil || seq-s.recvAck >= gotMax {
 		return nil // duplicate (just ack), or too far ahead
 	}
 	r.data = append([]byte(nil), b...)

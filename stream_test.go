@@ -123,3 +123,90 @@ func TestStreamResetDropsReplies(t *testing.T) {
 		t.Fatalf("after the restart: %d queued, next %d", len(a.queue), a.next)
 	}
 }
+
+// A lost part with more than gotMax parts sent after it: the receiver must still take the
+// part its gap waits for, and the sender must not run gotMax past it. Before, the receiver
+// bounded the number of parts held above the gap: once gotMax arrived it dropped the missing
+// part's every copy, and delivery stopped for good while the session stayed alive.
+func TestStreamGapPastGotMax(t *testing.T) {
+	a, b := newStream(), newStream()
+	a.reliable = true // like TCP: no fast retransmit, the gap waits for the timer
+	const n = gotMax + 2000
+	for i := 0; i < n; i++ {
+		a.push([]byte(fmt.Sprintf("m%d", i)), false, 0, false)
+	}
+	var got []string
+	now := time.Unix(0, 0)
+	dropped := false
+	for step := 0; step < 20000 && len(got) < n; step++ {
+		now = now.Add(5 * time.Millisecond)
+		for i := 0; i < 256; i++ {
+			p, _ := a.nextPacket(now, false)
+			if p == nil {
+				break
+			}
+			if !dropped { // the first copy of part 1 is lost
+				dropped = true
+				continue
+			}
+			_ = b.receive(now, p, func(m []byte, _ bool, _ uint64) { got = append(got, string(m)) })
+			if len(b.got) > gotMax+1 {
+				t.Fatalf("receiver holds %d parts", len(b.got))
+			}
+		}
+		for {
+			p, _ := b.nextPacket(now, true)
+			if p == nil || len(p) <= 1 {
+				break
+			}
+			_ = a.receive(now, p, nil)
+			if !b.ackDue.IsZero() {
+				continue
+			}
+			break
+		}
+	}
+	if len(got) != n {
+		t.Fatalf("delivered %d of %d: recvAck=%d got=%d inflight=%d queue=%d", len(got), n, b.recvAck, len(b.got), len(a.inflight), len(a.queue))
+	}
+	for i, m := range got {
+		if m != fmt.Sprintf("m%d", i) {
+			t.Fatalf("message %d is %q", i, m)
+		}
+	}
+}
+
+// The receiver alone (an old sender runs ahead): the part at recvAck is taken even with
+// gotMax−1 parts held above it, and a part gotMax past it is dropped.
+func TestStreamReceiveWindow(t *testing.T) {
+	a, b := newStream(), newStream()
+	a.reliable = true
+	for i := 0; i < gotMax+1; i++ {
+		a.push([]byte{byte(i)}, false, 0, false)
+	}
+	var pkts [][]byte
+	now := time.Unix(0, 0)
+	for len(pkts) < gotMax+1 {
+		p, _ := a.nextPacket(now, false)
+		if p == nil { // the window: let everything sent so far count as acked
+			for seq := range a.inflight {
+				delete(a.inflight, seq)
+			}
+			a.inflightBytes = 0
+			continue
+		}
+		pkts = append(pkts, p)
+	}
+	n := 0
+	deliver := func([]byte, bool, uint64) { n++ }
+	for _, p := range pkts[1:] {
+		_ = b.receive(now, p, deliver)
+	}
+	if len(b.got) != gotMax-1 || b.recvAck != 1 {
+		t.Fatalf("held %d, recvAck %d", len(b.got), b.recvAck)
+	}
+	_ = b.receive(now, pkts[0], deliver)
+	if b.recvAck != gotMax+1 || n != gotMax {
+		t.Fatalf("after the gap: recvAck %d delivered %d", b.recvAck, n)
+	}
+}
