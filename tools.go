@@ -19,6 +19,7 @@ var fixedTools = map[string]int{
 	"p2pact.family":  3,
 	"p2pact.plugins": 4,
 	"p2pact.term":    5,
+	"p2pact.screen":  6,
 }
 
 // FixedTool is the number the spec gives a tool name (§8): 0–63, the same on every device.

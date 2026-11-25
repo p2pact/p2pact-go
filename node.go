@@ -139,6 +139,7 @@ type peerState struct {
 	lastTalk   time.Time
 	inbox      map[uint64]*inbox // calls and events waiting for their turn, per stream
 	forwards   []string          // the devices it forwards to for us, from its hello (forward.go)
+	lastKind   string            // the kind of its road when OnRoute last looked (route.go)
 }
 
 type inbound struct {
@@ -187,7 +188,8 @@ type Node struct {
 	// tries and nothing from the device for 10 s. A loss may be told by both. What the
 	// application sends the device meanwhile is still queued, as always, and goes if it comes
 	// back; OnGone is the sign to stop counting on that.
-	OnGone func(peer string)
+	OnGone  func(peer string)
+	onRoute func(peer string, r RouteInfo) // OnRoute (route.go)
 	// NoCompression turns compression off for what we send (benchmarks, debugging).
 	NoCompression bool
 	// NoLearning: do not train our own dictionaries on what we send (spec §5).
@@ -810,6 +812,19 @@ func (n *Node) Event(peer string, tool, event int, args ...any) error {
 
 // EventOn is Event on a stream (see CallOn).
 func (n *Node) EventOn(peer string, stream uint64, tool, event int, args ...any) error {
+	return n.EventOpts(peer, stream, tool, event, SendOpts{}, args...)
+}
+
+// SendOpts are how a message is sent beyond what it says.
+type SendOpts struct {
+	// Raw: the message is media (video) that is already compressed. It is sent as it is, never
+	// compressed and never added to the history a dictionary is trained on (spec §5). The wire
+	// is the same as for any message: the receiver needs nothing new.
+	Raw bool
+}
+
+// EventOpts is EventOn with options (SendOpts).
+func (n *Node) EventOpts(peer string, stream uint64, tool, event int, o SendOpts, args ...any) error {
 	msg, err := cbor.Marshal(append([]any{3, tool, event}, args...))
 	if err != nil {
 		return err
@@ -828,6 +843,10 @@ func (n *Node) EventOn(peer string, stream uint64, tool, event int, args ...any)
 		if n.grantLevelLocked(grants, n.toolNameLocked(tool)) < LevelRead {
 			return nil
 		}
+	}
+	if o.Raw {
+		n.pushRawLocked(ps, msg, stream)
+		return nil
 	}
 	n.pushLocked(ps, msg, stream, tool != 0, false)
 	return nil
@@ -1900,6 +1919,7 @@ func (n *Node) maintainLocked(now time.Time) {
 		}
 	}
 	n.unholdLocked(now)
+	n.routesLocked(now)
 	n.observeLocked(now, false)
 	n.reannounceLocked(now)
 	for idx, s := range n.sessions {
@@ -2016,6 +2036,12 @@ func (n *Node) pushLocked(ps *peerState, msg []byte, stream uint64, talk, reply 
 		return
 	}
 	ps.st.push(msg, false, stream, reply)
+}
+
+// pushRawLocked queues a message as it is: no compression, nothing learnt from it (SendOpts.Raw).
+func (n *Node) pushRawLocked(ps *peerState, msg []byte, stream uint64) {
+	defer n.wakeLocked()
+	ps.st.push(msg, false, stream, false)
 }
 
 // inboundLocked decompresses a reassembled message and runs it in order. A missing

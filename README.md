@@ -39,6 +39,9 @@ _, _ = phone.Call(ctx, peer.Addr, 1, 2, 1, "run the tests")
 - `CallOn` / `EventOn` — the same on a **stream**: in order within it, independent of other
   streams, so a loss on one chat does not hold up the others. Use one stream per chat.
   A stream's calls and events run one at a time, in the order sent.
+- `EventOpts` with `SendOpts{Raw: true}` — media already compressed (video): sent as it is,
+  not compressed and not learnt from. `Backlog`, `Route` (`lan`, `direct`, `relay`, `app`,
+  `via`; round trip, rate, MTU), `OnRoute` and `ProbeNow` let a sender pace a stream to its road.
 - `Later` — a handler that waits long (an agent's turn, a person's answer) returns
   `nil, p2pact.Later(work)`: its stream goes on at once, and what `work` returns is sent when
   it is ready.
