@@ -134,3 +134,30 @@ func TestRouteBacklogOnRoute(t *testing.T) {
 	a.SetPaused(false)
 	eventually(t, "backlog drained", func() bool { p, _ := a.Backlog(b.ID.Addr()); return p == 0 })
 }
+
+// Unanswered is 0 while nothing waits for an acknowledgement or the device answers, and grows
+// once the device is silent while data to it is unacknowledged.
+func TestUnanswered(t *testing.T) {
+	a, b := node(t, "Mac", true, nil), node(t, "Phone", true, nil)
+	defer a.Close()
+	stopB := stopper(t, b)
+	if d := a.Unanswered("nobody"); d != 0 {
+		t.Fatalf("a stranger: %v", d)
+	}
+	pair(t, a, b)
+	echo(t, a, b, []byte("hi"), 5*time.Second)
+	for i := 0; i < 20; i++ {
+		_ = a.EventOpts(b.ID.Addr(), 5, 64, 1, SendOpts{Raw: true}, bytes.Repeat([]byte{7}, 3000))
+		time.Sleep(50 * time.Millisecond)
+		if d := a.Unanswered(b.ID.Addr()); d > time.Second {
+			t.Fatalf("a live device unanswered for %v", d)
+		}
+	}
+	eventually(t, "all acknowledged", func() bool { p, _ := a.Backlog(b.ID.Addr()); return p == 0 && a.Unanswered(b.ID.Addr()) == 0 })
+	stopB()
+	_ = a.EventOpts(b.ID.Addr(), 5, 64, 1, SendOpts{Raw: true}, bytes.Repeat([]byte{7}, 3000))
+	time.Sleep(1500 * time.Millisecond)
+	if d := a.Unanswered(b.ID.Addr()); d < time.Second || d > 3*time.Second {
+		t.Fatalf("a vanished device unanswered for %v, want about 1.5 s", d)
+	}
+}

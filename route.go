@@ -42,6 +42,45 @@ func (n *Node) Backlog(peer string) (parts, bytes int) {
 	return parts, bytes
 }
 
+// Unanswered is how long data sent to a device has gone without anything heard back from it on
+// any road: the time since the later of the last packet from the device and the first send of
+// the oldest part still unacknowledged. 0 — nothing is waiting for an acknowledgement (or the
+// device is unknown). A road change does not reset it by itself, but the packets of the new road
+// do: only a device that is silent on every road makes it grow. A sender of video closes its
+// session when it passes a few seconds (a viewer that vanished acknowledges nothing), instead of
+// waiting for OnGone (10 s) or for the roads to age out (60 s).
+func (n *Node) Unanswered(peer string) time.Duration {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	ps := n.peers[peer]
+	if ps == nil || len(ps.st.inflight) == 0 {
+		return 0
+	}
+	now := time.Now()
+	var since time.Time // the first send of the oldest unacknowledged part
+	for _, p := range ps.st.inflight {
+		t := p.sent
+		if len(p.copies) > 0 {
+			t = p.copies[0]
+		}
+		if since.IsZero() || (!t.IsZero() && t.Before(since)) {
+			since = t
+		}
+	}
+	if s := n.current[peer]; s != nil && s.lastRecv.After(since) {
+		since = s.lastRecv
+	}
+	for _, e := range ps.eps {
+		if e.lastRecv.After(since) {
+			since = e.lastRecv
+		}
+	}
+	if since.IsZero() {
+		return 0
+	}
+	return max(now.Sub(since), 0)
+}
+
 // Route describes the road the session to a device runs on (RouteInfo).
 func (n *Node) Route(peer string) RouteInfo {
 	n.mu.Lock()
